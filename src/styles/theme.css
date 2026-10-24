@@ -1,0 +1,143 @@
+/* LsletUI - iOS 灵动岛风格主题 */
+
+:root {
+  /* 背景层级 */
+  --island-bg: rgba(12, 12, 14, 0.78);
+  --island-bg-solid: #000000;
+  --card-bg: rgba(255, 255, 255, 0.04);
+  --card-bg-hover: rgba(255, 255, 255, 0.08);
+  --card-bg-active: rgba(255, 255, 255, 0.12);
+
+  /* 边框 */
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --border-focus: rgba(10, 132, 255, 0.5);
+
+  /* 文字 */
+  --text-primary: rgba(255, 255, 255, 0.92);
+  --text-secondary: rgba(255, 255, 255, 0.55);
+  --text-tertiary: rgba(255, 255, 255, 0.35);
+
+  /* 强调色 - iOS 系统蓝 */
+  --accent: #0a84ff;
+  --accent-hover: #409cff;
+  --accent-bg: rgba(10, 132, 255, 0.2);
+  --accent-bg-hover: rgba(10, 132, 255, 0.3);
+
+  /* 状态色 */
+  --success: #30d158;
+  --warning: #ffd60a;
+  --error: #ff453a;
+
+  /* 圆角 */
+  --radius-card: 12px;
+  --radius-button: 8px;
+  --radius-capsule: 22px;
+
+  /* 动画 */
+  --ease-out: cubic-bezier(0.32, 0.72, 0, 1);
+  --duration-fast: 200ms;
+  --duration-normal: 320ms;
+}
+
+/* 全局基础样式 */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, 'PingFang SC',
+    'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 应用容器 */
+#app, .app-container {
+  width: 100%;
+  height: 100%;
+}
+
+/* 面板入场/出场动画 */
+.app-container {
+  transition: opacity var(--duration-normal) var(--ease-out),
+              transform var(--duration-normal) var(--ease-out);
+}
+
+.panel-hidden .app-container {
+  opacity: 0;
+  transform: translateY(8px) scale(0.96);
+}
+
+.panel-visible .app-container {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+/* 通用卡片 */
+.island-card {
+  background: var(--card-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-card);
+  padding: 12px;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+
+/* 通用按钮 */
+.island-button {
+  background: var(--card-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-button);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: all var(--duration-fast) var(--ease-out);
+}
+
+.island-button:hover {
+  background: var(--card-bg-hover);
+  border-color: var(--border-strong);
+}
+
+.island-button:active {
+  background: var(--card-bg-active);
+  transform: scale(0.97);
+}
+
+/* 强调按钮 */
+.island-button-accent {
+  background: var(--accent-bg);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.island-button-accent:hover {
+  background: var(--accent-bg-hover);
+  border-color: var(--accent-hover);
+  color: var(--accent-hover);
+}
+
+/* 滚动条 */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-subtle);
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-strong);
+}
