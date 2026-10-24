@@ -1,0 +1,19 @@
+# LsletUI - 轻量级灵动岛应用
+# Python依赖
+
+# PySide6 核心
+PySide6>=6.5.0
+PySide6-Addons>=6.5.0
+PySide6-Essentials>=6.5.0
+
+# 系统通知
+win11toast>=0.36.0
+win10toast>=0.9
+
+# 系统工具
+psutil>=5.9.0
+pywin32>=306
+
+# 开发工具（可选）
+# nuitka>=1.8.0
+# ordered-set>=4.1.0

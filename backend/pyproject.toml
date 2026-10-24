@@ -1,0 +1,63 @@
+[project]
+name = "pyisland-lite"
+version = "0.1.0"
+description = "轻量级灵动岛应用 - 低内存占用，长时间运行"
+readme = "README.md"
+license = {text = "PolyForm-Noncommercial-1.0.0"}
+requires-python = ">=3.9"
+authors = [
+    {name = "LsletUI Authors"}
+]
+keywords = ["desktop", "widget", "island", "lightweight"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "License :: Other/Proprietary License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Desktop Environment",
+    "Topic :: Utilities",
+]
+
+dependencies = [
+    "PySide6>=6.5.0",
+    "PySide6-Addons>=6.5.0",
+    "PySide6-Essentials>=6.5.0",
+    "win11toast>=0.36.0",
+    "win10toast>=0.9",
+    "psutil>=5.9.0",
+    "pywin32>=306",
+]
+
+[project.optional-dependencies]
+dev = [
+    "nuitka>=1.8.0",
+    "ordered-set>=4.1.0",
+    "pylint>=3.0.0",
+    "black>=23.0.0",
+]
+
+[project.scripts]
+pyisland-lite = "main:main"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.black]
+line-length = 88
+target-version = ['py39']
+
+[tool.pylint.messages_control]
+disable = [
+    "C0114",
+    "C0115",
+    "C0116",
+]
