@@ -1,4 +1,4 @@
-# LsletUI 免费版（Free Edition）
+# LsletUI 
 
 Windows 桌面灵动岛应用：屏幕顶部常驻胶囊 + 原生 Qt 主界面。本仓库为**免费功能版**，
 使用 Python (PySide6) 实现，不含任何联网服务、账号体系与付费功能。
