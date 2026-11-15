@@ -1,4 +1,4 @@
-# LsletUI - 轻量级灵动岛应用
+# LsletUI 免费版 - 轻量级灵动岛应用
 # Python依赖
 
 # PySide6 核心
@@ -6,13 +6,24 @@ PySide6>=6.5.0
 PySide6-Addons>=6.5.0
 PySide6-Essentials>=6.5.0
 
-# 系统通知
+# 系统通知（win11toast 内部依赖 winrt，通知中心相关命名空间必须保留）
 win11toast>=0.36.0
 win10toast>=0.9
+winrt-runtime>=4.1.0
+winrt-Windows.Foundation>=10.0.0
+winrt-Windows.Foundation.Collections>=10.0.0
+winrt-Windows.ApplicationModel>=10.0.0
+winrt-Windows.UI.Notifications>=10.0.0
+winrt-Windows.UI.Notifications.Management>=10.0.0
 
 # 系统工具
 psutil>=5.9.0
 pywin32>=306
+# GPU 温度/占用（NVML，模块名为 pynvml；仅 NVIDIA 显卡可读）
+nvidia-ml-py>=12.0
+
+# 图标生成（仅构建期使用：make_ico.py / create_icon.py）
+Pillow>=10.0.0
 
 # 开发工具（可选）
 # nuitka>=1.8.0

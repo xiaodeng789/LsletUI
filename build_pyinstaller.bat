@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul 2>&1
 echo ========================================
-echo LsletUI - PyInstaller 多项目打包脚本
+echo LsletUI 免费版 - PyInstaller 多项目打包脚本
 echo onedir 模式 / 禁用 UPX / 带版本信息
 echo ========================================
 echo.
@@ -13,7 +13,7 @@ rem 自动检测 Python 路径
 rem ========================================
 set "PYTHON_EXE="
 
-rem 尝试系统 PATH 中的 python
+rem 优先使用系统 PATH 中的 python
 where python >nul 2>&1
 if not errorlevel 1 (
     set "PYTHON_EXE=python"
@@ -62,9 +62,9 @@ rem ========================================
 rem 清理旧产物目录
 rem ========================================
 echo 清理旧产物目录...
-if exist "..\exe\LsletUI" (
-    echo   清理 ..\exe\LsletUI ...
-    rmdir /s /q "..\exe\LsletUI"
+if exist "..\exe\LsletUIFree" (
+    echo   清理 ..\exe\LsletUIFree ...
+    rmdir /s /q "..\exe\LsletUIFree"
 )
 if exist "..\exe\PyIslandLite" (
     echo   清理 ..\exe\PyIslandLite ...
@@ -73,15 +73,15 @@ if exist "..\exe\PyIslandLite" (
 
 echo.
 echo 开始多项目打包...
-echo 说明：同时打包 LsletUI 和 PyIslandLite 两个可执行文件
+echo 说明：同时打包 LsletUIFree（免费版主应用）和 PyIslandLite 两个可执行文件
 echo 这可能需要 10-20 分钟，请耐心等待...
 echo.
 
 rem ========================================
-rem [1/2] 打包 LsletUI 主应用
+rem [1/2] 打包 LsletUI 免费版主应用
 rem ========================================
 echo ========================================
-echo [1/2] 打包 LsletUI 主应用 (PySide6 灵动岛)
+echo [1/2] 打包 LsletUIFree 主应用 (PySide6 灵动岛)
 echo ========================================
 echo.
 
@@ -90,17 +90,17 @@ echo.
     --clean ^
     LsletUI.spec ^
     --distpath="../exe" ^
-    --workpath="../exe/build_LsletUI"
+    --workpath="../exe/build_LsletUIFree"
 
 if errorlevel 1 (
     echo.
-    echo [错误] LsletUI 打包失败！
+    echo [错误] LsletUIFree 打包失败！
     pause
     exit /b 1
 )
 
 echo.
-echo [LsletUI] 打包完成！
+echo [LsletUIFree] 打包完成！
 echo.
 
 rem ========================================
@@ -133,7 +133,7 @@ rem ========================================
 rem 清理构建临时文件
 rem ========================================
 echo 清理构建临时文件...
-if exist "..\exe\build_LsletUI" rmdir /s /q "..\exe\build_LsletUI"
+if exist "..\exe\build_LsletUIFree" rmdir /s /q "..\exe\build_LsletUIFree"
 if exist "..\exe\build_PyIslandLite" rmdir /s /q "..\exe\build_PyIslandLite"
 
 rem ========================================
@@ -153,13 +153,13 @@ echo ========================================
 echo PyInstaller 多项目打包完成！
 echo.
 echo 可执行文件位置:
-echo   1. LsletUI 主应用:     exe\LsletUI\LsletUI.exe
-echo   2. PyIslandLite 服务:  exe\PyIslandLite\PyIslandLite.exe
+echo   1. LsletUI 免费版主应用: exe\LsletUIFree\LsletUIFree.exe
+echo   2. PyIslandLite 服务:    exe\PyIslandLite\PyIslandLite.exe
 echo.
 echo 分发说明:
-echo   - LsletUI: 灵动岛主应用（带前端界面）
+echo   - LsletUIFree: 灵动岛主应用（原生界面，含日志控制台）
 echo   - PyIslandLite: 灵动岛后台服务（纯后台运行）
-echo   - 分发时请分别打包整个 LsletUI 和 PyIslandLite 文件夹
+echo   - 分发时请分别打包整个 LsletUIFree 和 PyIslandLite 文件夹
 echo ========================================
 echo.
 pause

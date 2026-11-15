@@ -9,6 +9,8 @@ import warnings
 
 from PySide6.QtCore import QObject, Signal, QTimer
 
+from capsule_app.debug_log import dlog
+
 POLL_MS = 2000  # 采样间隔
 
 # 高负载进入阈值：任一指标达到即记一次高样本
@@ -30,7 +32,7 @@ class HardwareMonitorBackend(QObject):
     无需额外工作线程。
     """
 
-    stats_updated = Signal(dict)        # 每次采样：cpu/mem/gpu/gpu_temp/net_up/net_down
+    stats_updated = Signal(dict)        # 每次采样：cpu/mem/cpu_temp/gpu/gpu_temp/net_up/net_down
     alert_changed = Signal(bool, dict)  # 高负载开始(True)/结束(False)，附带当前采样
 
     def __init__(self):
@@ -67,8 +69,10 @@ class HardwareMonitorBackend(QObject):
             pynvml.nvmlInit()
             self._nvml = pynvml
             self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            dlog("HW", "NVML 初始化成功（可读 GPU 温度）")
         except Exception as e:
             print(f"[Hardware] NVML 不可用（无 GPU 数据）: {e}")
+            dlog("HW", f"NVML 不可用（GPU 温度将显示 --）: {e!r}")
 
     def _sample(self):
         """采集一次系统指标"""
@@ -77,6 +81,10 @@ class HardwareMonitorBackend(QObject):
         stats = {
             "cpu": psutil.cpu_percent(interval=None),
             "mem": psutil.virtual_memory().percent,
+            # CPU 温度在 Windows 上无可靠来源：psutil.sensors_temperatures()
+            # 仅 Linux 实现，WMI MSAcpi_ThermalZoneTemperature 本项目实测不可用，
+            # NVML 只能读 GPU。保持 None，界面按 -- 显示，不伪造数据。
+            "cpu_temp": None,
             "gpu": None,
             "gpu_temp": None,
             "net_up": 0.0,
@@ -133,6 +141,9 @@ class HardwareMonitorBackend(QObject):
             return
 
         self.stats_updated.emit(stats)
+        dlog("HW", "sample cpu=%s mem=%s cpu_temp=%s gpu=%s gpu_temp=%s" % (
+            stats.get("cpu"), stats.get("mem"), stats.get("cpu_temp"),
+            stats.get("gpu"), stats.get("gpu_temp")))
 
         if self._is_high(stats):
             self._high_streak += 1

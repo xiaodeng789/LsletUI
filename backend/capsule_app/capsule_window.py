@@ -8,14 +8,15 @@ import json
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import (Qt, QTimer, QSize, QPoint, QRect, QRectF,
-                            QPropertyAnimation, QEasingCurve, Property,
-                            QAbstractAnimation, Signal, QDateTime)
+from PySide6.QtCore import (Qt, QTimer, QSize, QSizeF, QPoint, QPointF,
+                            QRect, QRectF, QUrl,
+                            QPropertyAnimation, QVariantAnimation, QEasingCurve,
+                            Property, QAbstractAnimation, Signal, QDateTime)
 from PySide6.QtGui import (QIcon, QColor, QPainter, QBrush, QPen,
                            QPainterPath, QLinearGradient, QFontMetrics,
-                           QPixmap, QImage)
+                           QPixmap, QImage, QDesktopServices)
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget,
-                               QSystemTrayIcon, QMenu, QGraphicsDropShadowEffect)
+                               QMessageBox, QSystemTrayIcon, QMenu)
 from PySide6.QtGui import QAction
 
 # 导入资源路径兼容模块
@@ -25,8 +26,15 @@ if not getattr(_sys, 'frozen', False):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from resource_path import get_resource_path, get_config_path
 
+from capsule_app.debug_log import dlog
+
 PROJECT_ROOT = get_resource_path("")
 CONFIG_FILE = get_config_path()
+
+# 检测到游戏后，等待首帧帧率数据的宽限时长（毫秒）。
+# 超过该时长仍无数据（如用户取消 PresentMon 提权）则兜底切入游戏形态，
+# 避免灵动岛「先以空占位的瘦小样式出现、稍后才正常显示帧率」。
+GAME_ENTER_GRACE_MS = 2000
 
 
 def load_config():
@@ -36,10 +44,30 @@ def load_config():
         "hover": {"width": 240, "height": 52},
         "music_collapsed": {"width": 260, "height": 44},
         "music_hover": {"width": 320, "height": 56},
+        # 视频形态：与音乐尺寸相同，但独立配置方便调整
+        "video_collapsed": {"width": 280, "height": 44},
+        "video_hover": {"width": 340, "height": 56},
         "download_collapsed": {"width": 270, "height": 44},
         "download_hover": {"width": 400, "height": 56},
         "bt_notify": {"width": 300, "height": 64},
+        "clipboard_notify": {"width": 310, "height": 48},
         "hw_alert": {"width": 348, "height": 84},
+        "calendar_notify": {"width": 320, "height": 64},
+        "todo_notify": {"width": 320, "height": 64},
+        "call_active": {"width": 248, "height": 44},
+        "call_hover": {"width": 310, "height": 56},
+        "code_notify": {"width": 320, "height": 56},
+        "transfer_notify": {"width": 320, "height": 56},
+        # 验证码抓取（Windows 通知中心轮询）
+        "code_sniffer": {
+            "enabled": True,
+            "min_digits": 4,
+            "max_digits": 8,
+            "poll_interval_ms": 4000,
+            "dedup_seconds": 300,
+            "ignore_apps": ["LsletUI"],
+            "request_access": False,
+        },
         "background_color": "#000000",
         "background_alpha": 0.92,
         "anchor": "top_center",
@@ -128,6 +156,10 @@ class DynamicIslandWidget(QWidget):
 
     clicked = Signal()
     media_control_clicked = Signal(str)  # "playpause" | "next" | "prev"
+    open_link_requested = Signal(str)  # 剪贴板通知上的"打开"按钮（链接文本）
+    calendar_open_requested = Signal(str)  # 日历通知点击：打开 Outlook 约会（EntryID）
+    code_copy_requested = Signal()  # 验证码通知点击：复制验证码到剪贴板
+    transfer_open_requested = Signal()  # 手机互传完成提示点击：打开接收目录
 
     def __init__(self, config, parent=None):
         super().__init__(parent)
@@ -145,6 +177,12 @@ class DynamicIslandWidget(QWidget):
         self._music_collapsed_size = QSize(music_collapsed["width"], music_collapsed["height"])
         self._music_hover_size = QSize(music_hover["width"], music_hover["height"])
 
+        # 视频形态尺寸（独立于音乐，可配置）
+        video_collapsed = config.get("video_collapsed", music_collapsed)
+        video_hover = config.get("video_hover", music_hover)
+        self._video_collapsed_size = QSize(video_collapsed["width"], video_collapsed["height"])
+        self._video_hover_size = QSize(video_hover["width"], video_hover["height"])
+
         download_collapsed = config.get("download_collapsed", {"width": 270, "height": 44})
         download_hover = config.get("download_hover", {"width": 400, "height": 56})
         self._download_collapsed_size = QSize(download_collapsed["width"], download_collapsed["height"])
@@ -153,21 +191,114 @@ class DynamicIslandWidget(QWidget):
         bt_notify = config.get("bt_notify", {"width": 300, "height": 64})
         self._bt_notify_size = QSize(bt_notify["width"], bt_notify["height"])
 
+        clipboard_notify = config.get(
+            "clipboard_notify", {"width": 310, "height": 48})
+        self._clipboard_notify_size = QSize(clipboard_notify["width"],
+                                            clipboard_notify["height"])
+
         hw_alert = config.get("hw_alert", {"width": 348, "height": 84})
         self._hw_alert_size = QSize(hw_alert["width"], hw_alert["height"])
+
+        calendar_notify = config.get(
+            "calendar_notify", {"width": 320, "height": 64})
+        self._calendar_notify_size = QSize(calendar_notify["width"],
+                                           calendar_notify["height"])
+
+        # 待办到点提醒形态（与日历通知同尺寸，独立状态）
+        todo_notify = config.get("todo_notify", {"width": 320, "height": 64})
+        self._todo_notify_size = QSize(todo_notify["width"],
+                                       todo_notify["height"])
+
+        # 验证码通知形态（来源 + 验证码 + 点击复制）
+        code_notify = config.get("code_notify", {"width": 320, "height": 56})
+        self._code_notify_size = QSize(code_notify["width"],
+                                       code_notify["height"])
+
+        # 手机互传完成提示形态（与验证码通知同尺寸，独立状态）
+        transfer_notify = config.get(
+            "transfer_notify", {"width": 320, "height": 56})
+        self._transfer_notify_size = QSize(transfer_notify["width"],
+                                           transfer_notify["height"])
+
+        call_active = config.get("call_active", {"width": 248, "height": 44})
+        call_hover = config.get("call_hover", {"width": 310, "height": 56})
+        self._call_active_size = QSize(call_active["width"],
+                                       call_active["height"])
+        self._call_hover_size = QSize(call_hover["width"],
+                                      call_hover["height"])
 
         # 硬件高负载告警（后端做阈值+迟滞，岛只负责展示与形变）
         self._hw_alert = False
         self._hw_stats = None
+
+        # 游戏帧率（PresentMon 采集，游戏中在岛上直接显示 FPS + 温度/内存）
+        self._game_fps = None
+        # 游戏形态复用的系统指标（CPU/GPU 温度、内存占用），来源于硬件采样
+        self._sys_stats = {}
+        game_fps_collapsed = config.get(
+            "game_fps_collapsed", {"width": 312, "height": 44})
+        game_fps_hover = config.get(
+            "game_fps_hover", {"width": 352, "height": 56})
+        self._game_fps_collapsed_size = QSize(
+            game_fps_collapsed["width"], game_fps_collapsed["height"])
+        self._game_fps_hover_size = QSize(
+            game_fps_hover["width"], game_fps_hover["height"])
+
+        # 剪贴板复制瞬时通知（dict: kind/preview/url/image/...）
+        self._clipboard_event = None
+        self._clip_hide_timer = None
+        self._clip_icon_scale = 1.0
+        self._clipboard_open_url = None
+        self._clip_scaled_pixmap = None
+        self._clip_scaled_pixmap_key = None
+
+        # 验证码通知（dict: code/source），点击整块即复制
+        self._code_event = None
+        self._code_hide_timer = None
+        self._code_copied = False
+
+        # 手机互传完成提示（dict: name/size/count/dir），点击打开接收目录
+        self._transfer_event = None
+        self._transfer_hide_timer = None
 
         # 蓝牙耳机连接/断开瞬时通知（dict: name/connected），仅展示数秒
         self._bt_event = None
         self._bt_hide_timer = None
         self._bt_icon_scale = 1.0
 
+        # 日历下一条日程临近提醒（dict: subject/start/end/location/entry_id）
+        self._calendar_event = None
+        self._cal_hide_timer = None
+        self._cal_icon_scale = 1.0
+        self._calendar_open_id = None
+
+        # 待办到点提醒（dict: id/text/remindAt），点击打开控制台待办页
+        self._todo_event = None
+        self._todo_hide_timer = None
+        self._todo_icon_scale = 1.0
+
+        # Teams/微信通话状态（dict: active/app/app_name/started_at/elapsed）
+        self._call_info = None
+        self._call_end_timer = None
+        self._call_icon_scale = 1.0
+        self._call_tick_timer = QTimer(self)
+        self._call_tick_timer.setInterval(1000)  # 通话计时每秒刷新
+        self._call_tick_timer.timeout.connect(self.update)
+
+        # Mora 语音助手状态（dict: state=listening|thinking|speaking/name）
+        self._mora_state = None
+        self._mora_wave = 0
+        self._mora_tick = QTimer(self)
+        self._mora_tick.setInterval(200)   # 声波动效 200ms/帧（原 160ms，降低重绘频率）
+        self._mora_tick.timeout.connect(self._on_mora_tick)
+        mora_state_cfg = config.get("mora_state", {"width": 260, "height": 52})
+        self._mora_state_size = QSize(mora_state_cfg["width"],
+                                      mora_state_cfg["height"])
+
         # 音乐信息
         self._music_info = None  # dict: playing/title/artist/thumbnail(b64)
         self._music_thumb = None  # QPixmap
+        self._music_thumb_src = None  # 当前封面的 base64，避免每次进度推送重复解码
 
         # 下载信息（dict: active/state/filename/received/total/speed/count）
         self._download_info = None
@@ -178,8 +309,8 @@ class DynamicIslandWidget(QWidget):
         self._dl_anim_timer.setInterval(160)  # 5 帧 × 160ms = 800ms 一循环（原 120ms，降低重绘频率）
         self._dl_anim_timer.timeout.connect(self._on_dl_anim_tick)
 
-        # 阴影留边（外圈需要留出空间绘制阴影）
-        self._shadow_margin = 10
+        # 无阴影：阴影边距设为 0
+        self._shadow_margin = 0
         self._animated_width = float(self._collapsed_size.width())
         self._animated_height = float(self._collapsed_size.height())
 
@@ -188,10 +319,8 @@ class DynamicIslandWidget(QWidget):
         # QFontMetrics 缓存（elidedText 高频调用，避免重复构造）
         self._fm_cache = {}
 
-        # 静态背景缓存（圆角矩形 + 高光 + 描边 + 手动阴影），尺寸/调光变化时重建
-        self._bg_pixmap = None
-        self._bg_key = None
-
+        # 背景直接在 paintEvent 中绘制（阴影为 4 层圆角矩形，无高斯模糊），
+        # 动画期间不再因尺寸变化每帧重建 QPixmap 缓存。
         # SVG 图标预渲染 QPixmap 缓存（避免每帧 renderer.render 软件光栅化）
         self._svg_pixmap_cache = {}
 
@@ -236,6 +365,7 @@ class DynamicIslandWidget(QWidget):
             "circle_bg": QColor(255, 255, 255, 30),
             "circle_bg_soft": QColor(255, 255, 255, 26),
             "circle_bg_weak": QColor(255, 255, 255, 20),
+            "circle_bg_mora": QColor(255, 255, 255, 28),
             # 状态色
             "ok": QColor(48, 209, 88),
             "warn": QColor(255, 199, 88),
@@ -252,43 +382,21 @@ class DynamicIslandWidget(QWidget):
     def _col(self, key):
         return self._colors[key]
 
-    def _rebuild_bg_cache(self):
-        """重建静态背景缓存（阴影 + 圆角矩形 + 顶部高光 + 1px 描边）
+    def _paint_background(self, painter):
+        """直接绘制背景：手动柔和阴影 + 主体圆角矩形 + 顶部高光 + 1px 描边
 
-        原实现使用 QGraphicsDropShadowEffect：每帧把整个 widget 光栅化到离屏
-        pixmap 再做高斯模糊（blur=28），在动画/动画帧中是主要卡顿来源。
-        这里在背景变化时一次性绘制多层递减透明度的圆角矩形模拟柔和阴影，
-        之后每次 paintEvent 仅 drawPixmap 一次即可。
+        原实现使用 QGraphicsDropShadowEffect（每帧高斯模糊 blur=28）是卡顿主因；
+        后改为 QPixmap 缓存，但动画期间宽高每帧变化导致缓存持续失效、每帧重建
+        QPixmap（分配+光栅化）同样开销不小。这里改为每帧直接用 QPainter 绘制
+        4 层无模糊圆角矩形阴影 + 主体，绘制量极小（~7 个图元），避免任何离屏
+        分配，动画期间稳定 60fps。
         """
-        w = int(self.width())
-        h = int(self.height())
-        if w <= 0 or h <= 0:
-            self._bg_pixmap = None
-            return
-        pm = QPixmap(w, h)
-        pm.fill(Qt.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.Antialiasing)
-
         m = float(self._shadow_margin)
         rect = QRectF(m, m, self._animated_width, self._animated_height)
         radius = rect.height() / 2.0
 
-        # --- 手动柔和阴影：多层向外扩散的圆角矩形（向下偏移 3px）---
-        # 4 层扩散，alpha 由外向内递增，轻柔投影
-        p.setPen(Qt.NoPen)
-        offset_y = 3.0
-        layers = 4
-        for i in range(layers, 0, -1):
-            frac = i / layers
-            expand = m * frac
-            alpha = int(4 + (layers - i) * 4)  # 4, 8, 12, 16
-            r = QRectF(rect)
-            r.adjust(-expand, -expand + offset_y, expand, expand + offset_y)
-            rad = r.height() / 2.0
-            path = QPainterPath()
-            path.addRoundedRect(r, rad, rad)
-            p.fillPath(path, QColor(0, 0, 0, alpha))
+        # --- 无阴影：直接绘制主体圆角矩形 ---
+        painter.setPen(Qt.NoPen)
 
         # --- 主体圆角矩形 ---
         body = QPainterPath()
@@ -296,25 +404,28 @@ class DynamicIslandWidget(QWidget):
         alpha = int(self._config.get("background_alpha", 0.92) * 255)
         if self._dimmed:
             alpha = int(alpha * 0.6)
-        p.fillPath(body, QColor(0, 0, 0, alpha))
+        painter.fillPath(body, QColor(0, 0, 0, alpha))
 
-        # --- 顶部高光 ---
+        # --- 顶部高光（配合液态玻璃，明显加强）---
         highlight = QLinearGradient(rect.topLeft(), rect.bottomLeft())
-        highlight.setColorAt(0.0, QColor(255, 255, 255, 10))
+        highlight.setColorAt(0.0, QColor(255, 255, 255, 26))
         highlight.setColorAt(0.5, QColor(255, 255, 255, 0))
-        p.fillPath(body, QBrush(highlight))
+        painter.fillPath(body, QBrush(highlight))
+
+        # --- 底部反光（模拟玻璃下缘的环境反射）---
+        bottom_reflect = QLinearGradient(
+            rect.bottomLeft(),
+            rect.bottomLeft() + QPointF(0, -rect.height() * 0.3))
+        bottom_reflect.setColorAt(0.0, QColor(255, 255, 255, 14))
+        bottom_reflect.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.fillPath(body, QBrush(bottom_reflect))
 
         # --- 1px 描边 ---
         pen = QPen(self._col("stroke"))
         pen.setWidthF(1.0)
-        p.setPen(pen)
-        p.setBrush(Qt.NoBrush)
-        p.drawPath(body)
-
-        p.end()
-        self._bg_pixmap = pm
-        self._bg_key = (w, h, round(self._animated_width, 2),
-                        round(self._animated_height, 2), self._dimmed)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(body)
 
     def _get_font(self, point_size, bold=False):
         """获取缓存的字体对象（避免每次绘制创建新 QFont）"""
@@ -337,38 +448,53 @@ class DynamicIslandWidget(QWidget):
         return fm
 
     def _init_animation(self):
-        """初始化尺寸动画"""
-        self._size_anim = QPropertyAnimation(self, b"animatedWidth", self)
+        """初始化尺寸动画
+
+        用单个 QSizeF 动画同时驱动宽高，避免原来两个 QPropertyAnimation
+        每帧各触发一次 _update_outer_size / sizeChanged.emit / update，
+        导致顶层窗口每帧被 DWM  resize 两次（动画卡顿主因）。
+        """
+        self._size_anim = QPropertyAnimation(self, b"animatedSize", self)
         self._size_anim.setEasingCurve(QEasingCurve.OutCubic)
-        self._size_anim_h = QPropertyAnimation(self, b"animatedHeight", self)
-        self._size_anim_h.setEasingCurve(QEasingCurve.OutCubic)
 
         # 蓝牙通知图标的弹出（回弹）动画
         self._bt_pop_anim = QPropertyAnimation(self, b"btIconScale", self)
         self._bt_pop_anim.setEasingCurve(QEasingCurve.OutBack)
         self._bt_pop_anim.setDuration(480)
 
+        # 剪贴板通知图标的弹出（回弹）动画
+        self._clip_pop_anim = QPropertyAnimation(self, b"clipIconScale", self)
+        self._clip_pop_anim.setEasingCurve(QEasingCurve.OutBack)
+        self._clip_pop_anim.setDuration(480)
+
+        # 日历通知图标的弹出（回弹）动画
+        self._cal_pop_anim = QPropertyAnimation(self, b"calIconScale", self)
+        self._cal_pop_anim.setEasingCurve(QEasingCurve.OutBack)
+        self._cal_pop_anim.setDuration(480)
+
+        # 待办提醒图标的弹出（回弹）动画
+        self._todo_pop_anim = QPropertyAnimation(self, b"todoIconScale", self)
+        self._todo_pop_anim.setEasingCurve(QEasingCurve.OutBack)
+        self._todo_pop_anim.setDuration(480)
+
+        # 通话状态图标的弹出（回弹）动画
+        self._call_pop_anim = QPropertyAnimation(self, b"callIconScale", self)
+        self._call_pop_anim.setEasingCurve(QEasingCurve.OutBack)
+        self._call_pop_anim.setDuration(480)
+
     # --- 动画属性 ---
-    def _get_animated_width(self):
-        return self._animated_width
+    def _get_animated_size(self):
+        return QSizeF(self._animated_width, self._animated_height)
 
-    def _set_animated_width(self, w):
-        self._animated_width = float(w)
+    def _set_animated_size(self, size):
+        # 宽高在同一帧内更新，只触发一次窗口 resize 与一次重绘
+        self._animated_width = float(size.width())
+        self._animated_height = float(size.height())
         self._update_outer_size()
         self.sizeChanged.emit(self._animated_width, self._animated_height)
         self.update()
 
-    def _get_animated_height(self):
-        return self._animated_height
-
-    def _set_animated_height(self, h):
-        self._animated_height = float(h)
-        self._update_outer_size()
-        self.sizeChanged.emit(self._animated_width, self._animated_height)
-        self.update()
-
-    animatedWidth = Property(float, _get_animated_width, _set_animated_width)
-    animatedHeight = Property(float, _get_animated_height, _set_animated_height)
+    animatedSize = Property(QSizeF, _get_animated_size, _set_animated_size)
     sizeChanged = Signal(float, float)
 
     # --- 蓝牙图标弹出缩放属性 ---
@@ -381,44 +507,135 @@ class DynamicIslandWidget(QWidget):
 
     btIconScale = Property(float, _get_bt_icon_scale, _set_bt_icon_scale)
 
+    # --- 剪贴板图标弹出缩放属性 ---
+    def _get_clip_icon_scale(self):
+        return self._clip_icon_scale
+
+    def _set_clip_icon_scale(self, scale):
+        self._clip_icon_scale = float(scale)
+        self.update()
+
+    clipIconScale = Property(float, _get_clip_icon_scale, _set_clip_icon_scale)
+
+    # --- 日历图标弹出缩放属性 ---
+    def _get_cal_icon_scale(self):
+        return self._cal_icon_scale
+
+    def _set_cal_icon_scale(self, scale):
+        self._cal_icon_scale = float(scale)
+        self.update()
+
+    calIconScale = Property(float, _get_cal_icon_scale, _set_cal_icon_scale)
+
+    # --- 待办提醒图标弹出缩放属性 ---
+    def _get_todo_icon_scale(self):
+        return self._todo_icon_scale
+
+    def _set_todo_icon_scale(self, scale):
+        self._todo_icon_scale = float(scale)
+        self.update()
+
+    todoIconScale = Property(float, _get_todo_icon_scale, _set_todo_icon_scale)
+
+    # --- 通话图标弹出缩放属性 ---
+    def _get_call_icon_scale(self):
+        return self._call_icon_scale
+
+    def _set_call_icon_scale(self, scale):
+        self._call_icon_scale = float(scale)
+        self.update()
+
+    callIconScale = Property(float, _get_call_icon_scale, _set_call_icon_scale)
+
     # --- 目标尺寸 ---
     def _download_visible(self):
         """下载胶囊是否可见（下载中 / 暂停 / 完成提示期间）"""
         info = self._download_info
         return bool(info and (info.get("active") or info.get("state") == "completed"))
 
+    def _game_fps_visible(self):
+        """游戏帧率胶囊是否可见（检测到游戏即显示，FPS 数据可稍后到达）"""
+        info = self._game_fps
+        return bool(info and info.get("running"))
+
     def _current_collapsed_size(self):
+        if self._code_event is not None:
+            return self._code_notify_size
+        if self._transfer_event is not None:
+            return self._transfer_notify_size
+        if self._clipboard_event is not None:
+            return self._clipboard_notify_size
         if self._bt_event is not None:
             return self._bt_notify_size
+        if self._calendar_event is not None:
+            return self._calendar_notify_size
+        if self._todo_event is not None:
+            return self._todo_notify_size
+        if self._call_info is not None:
+            return self._call_active_size
+        if self._mora_state is not None:
+            return self._mora_state_size
         if self._hw_alert:
             return self._hw_alert_size
+        if self._game_fps_visible():
+            return self._game_fps_collapsed_size
         if self._download_visible():
             return self._download_collapsed_size
         if self._music_info and self._music_info.get("title"):
+            # 视频形态：与音乐互斥，由 media_type 决定
+            if self._music_info.get("media_type") == "video":
+                return self._video_collapsed_size
             return self._music_collapsed_size
         return self._collapsed_size
 
     def _current_hover_size(self):
+        if self._code_event is not None:
+            return self._code_notify_size
+        if self._transfer_event is not None:
+            return self._transfer_notify_size
+        if self._clipboard_event is not None:
+            return self._clipboard_notify_size
         if self._bt_event is not None:
             return self._bt_notify_size
+        if self._calendar_event is not None:
+            return self._calendar_notify_size
+        if self._todo_event is not None:
+            return self._todo_notify_size
+        if self._call_info is not None:
+            return self._call_hover_size
+        if self._mora_state is not None:
+            return self._mora_state_size
         if self._hw_alert:
             return self._hw_alert_size
+        if self._game_fps_visible():
+            return self._game_fps_hover_size
         if self._download_visible():
             return self._download_hover_size
         if self._music_info and self._music_info.get("title"):
+            if self._music_info.get("media_type") == "video":
+                return self._video_hover_size
             return self._music_hover_size
         return self._hover_size
 
     # --- 动画控制 ---
     def _animate_to(self, target_size, duration):
-        """动画到目标尺寸"""
-        for anim, target in ((self._size_anim, target_size.width()),
-                             (self._size_anim_h, target_size.height())):
-            anim.stop()
-            anim.setDuration(duration)
-            anim.setStartValue(self._animated_width if anim is self._size_anim else self._animated_height)
-            anim.setEndValue(float(target))
-            anim.start()
+        """动画到目标尺寸（单动画同时驱动宽高，每帧仅一次 resize / 重绘）"""
+        self._size_anim.stop()
+        self._size_anim.setDuration(duration)
+        self._size_anim.setStartValue(
+            QSizeF(self._animated_width, self._animated_height))
+        self._size_anim.setEndValue(QSizeF(target_size))
+        self._size_anim.start()
+
+    def _snap_to(self, target_size):
+        """立即切换目标尺寸（无尺寸动画）
+
+        用于形态首次出现时的「直接以正常尺寸呈现」：避免先以旧形态的
+        较小尺寸出现、再用动画放大，产生「先瘦小后正常」的观感。
+        """
+        self._size_anim.stop()
+        self._set_animated_size(
+            QSizeF(float(target_size.width()), float(target_size.height())))
 
     def _expand(self, duration=None):
         anim_cfg = self._config.get("animation", {})
@@ -432,35 +649,54 @@ class DynamicIslandWidget(QWidget):
         self._animate_to(self._current_collapsed_size(), duration)
         self._state = "collapsed"
 
-    # --- 音乐信息 ---
+    # --- 媒体信息（音乐 + 视频通用） ---
     def set_music_info(self, info):
-        """设置音乐信息并触发布局更新"""
+        """设置媒体信息（音乐或视频）并触发布局更新"""
         import base64 as _b64
         old_title = (self._music_info or {}).get("title") if self._music_info else None
+        old_type = (self._music_info or {}).get("media_type") if self._music_info else None
         self._music_info = info
 
         thumb_b64 = info.get("thumbnail") if info else None
-        if thumb_b64:
-            try:
-                img = QImage.fromData(_b64.b64decode(thumb_b64))
-                # 预裁切为圆形并缩放到胶囊高度，绘制时直接 drawPixmap，
-                # 避免每帧 setClipPath + drawPixmap + setClipping(False)
-                self._music_thumb = self._make_circular_thumb(
-                    QPixmap.fromImage(img))
-            except Exception:
+        # 同一封面不重复解码：视频 1 秒级进度推送时，重复 base64→QImage 解码
+        # 会造成明显 CPU 抖动
+        if thumb_b64 != self._music_thumb_src:
+            self._music_thumb_src = thumb_b64
+            if thumb_b64:
+                try:
+                    img = QImage.fromData(_b64.b64decode(thumb_b64))
+                    # 预裁切为圆形并缩放到胶囊高度，绘制时直接 drawPixmap，
+                    # 避免每帧 setClipPath + drawPixmap + setClipping(False)
+                    self._music_thumb = self._make_circular_thumb(
+                        QPixmap.fromImage(img))
+                except Exception:
+                    self._music_thumb = None
+            else:
                 self._music_thumb = None
-        else:
-            self._music_thumb = None
 
-        # 音乐状态变化时，如果当前是收起状态且有新歌或无歌了，重新计算尺寸
+        # 状态/类型变化时，如果当前是收起状态，重新计算尺寸
         new_title = info.get("title") if info else None
-        if self._state == "collapsed" and old_title != new_title:
+        new_type = info.get("media_type") if info else None
+        type_changed = (old_type != new_type)
+        if self._state == "collapsed" and (old_title != new_title or type_changed):
             self._animate_to(self._current_collapsed_size(), 200)
-            # 新歌出现：短暂展开提示（iPhone 灵动岛标志性行为）
-            # （蓝牙瞬时通知展示中不改尺寸，避免内容与尺寸错位）
-            if new_title and not old_title and self._bt_event is None:
+            # 新歌/新视频出现：短暂展开提示（iPhone 灵动岛标志性行为）
+            # （剪贴板/蓝牙瞬时通知展示中不改尺寸，避免内容与尺寸错位）
+            if new_title and not old_title and self._clipboard_event is None \
+                    and self._bt_event is None \
+                    and self._calendar_event is None \
+                    and self._todo_event is None \
+                    and self._code_event is None \
+                    and self._transfer_event is None:
                 self._expand(duration=200)
                 QTimer.singleShot(2500, self._auto_collapse)
+            # 同类型切换但无新标题（极少）：也展开一下
+            elif type_changed and self._clipboard_event is None \
+                    and self._bt_event is None \
+                    and self._code_event is None \
+                    and self._transfer_event is None:
+                self._expand(duration=200)
+                QTimer.singleShot(2000, self._auto_collapse)
         self.update()
 
     def _make_circular_thumb(self, pixmap):
@@ -488,6 +724,124 @@ class DynamicIslandWidget(QWidget):
         if not self.underMouse() and self._state == "hover":
             self._collapse()
 
+    # --- 游戏帧率 ---
+    def set_game_fps_info(self, info):
+        """设置游戏帧率信息（dict: running/fps/process/frame_time）"""
+        old_visible = self._game_fps_visible()
+        self._game_fps = info if info and info.get("running") else None
+        now_visible = self._game_fps_visible()
+
+        if now_visible and not old_visible:
+            # 游戏开始：直接切换为瘦小帧率形态（窗口层同步钉到右上角），
+            # 不做展开提示，避免遮挡游戏画面；尺寸直接到位，不再从小尺寸放大
+            target = (self._current_hover_size() if self._state == "hover"
+                      else self._current_collapsed_size())
+            self._snap_to(target)
+        elif not now_visible and old_visible and self._state == "collapsed":
+            self._animate_to(self._current_collapsed_size(), 220)
+        self.update()
+
+    def set_system_stats(self, stats):
+        """更新游戏形态里展示的系统指标（CPU/GPU 温度、内存占用）
+
+        复用硬件监控的既有采样（约 2s 一次），无游戏形态时只缓存不重绘，
+        不额外增加采集或刷新开销。
+        """
+        if not stats:
+            return
+        self._sys_stats = {
+            "cpu": stats.get("cpu"),
+            "cpu_temp": stats.get("cpu_temp"),
+            "gpu_temp": stats.get("gpu_temp"),
+            "mem": stats.get("mem"),
+        }
+        if self._game_fps_visible():
+            self.update()
+
+    @staticmethod
+    def _fmt_temp(value):
+        """温度值格式化：拿不到温度时显示 --，不伪造数据"""
+        try:
+            return f"{int(round(float(value)))}℃"
+        except (TypeError, ValueError):
+            return "--"
+
+    @staticmethod
+    def _fmt_percent(value):
+        """百分比格式化：无数据时显示 --"""
+        try:
+            return f"{int(round(float(value)))}%"
+        except (TypeError, ValueError):
+            return "--"
+
+    def _paint_game_fps_content(self, painter, rect):
+        """绘制游戏帧率：大号 FPS 数字 + 单位 + CPU/GPU 温度 + 内存占用"""
+        info = self._game_fps or {}
+        stats = self._sys_stats or {}
+        fps = float(info.get("fps") or 0)
+        alpha = 230 if not self._dimmed else 130
+
+        left, top = rect.left(), rect.top()
+        w, h = rect.width(), rect.height()
+        pad = 12
+
+        if fps > 0:
+            fps_text = str(int(round(fps))) if fps >= 100 else f"{fps:.1f}"
+        else:
+            # 采集器尚未产出数据（提权中/无输出）时显示占位，避免出现 0.0
+            fps_text = "--"
+        num_font = self._get_font(19, True)
+        fm = self._get_fm(19, True)
+        num_w = fm.horizontalAdvance(fps_text)
+
+        painter.setFont(num_font)
+        painter.setPen(QColor(255, 255, 255, alpha))
+        painter.drawText(QRectF(left + pad, top, num_w + 6, h),
+                         Qt.AlignLeft | Qt.AlignVCenter, fps_text)
+
+        unit_x = left + pad + num_w + 5
+        unit_fm = self._get_fm(8, True)
+        unit_w = unit_fm.horizontalAdvance("FPS")
+        painter.setFont(self._get_font(8, True))
+        painter.setPen(QColor(255, 255, 255, 150 if not self._dimmed else 90))
+        painter.drawText(QRectF(unit_x, top + h * 0.52, unit_w + 2, 14),
+                         Qt.AlignLeft | Qt.AlignVCenter, "FPS")
+
+        # FPS 之后依次追加：CPU 温度 / GPU 温度 / 内存占用（无数据时显示 --）
+        label_font = self._get_font(8)
+        value_font = self._get_font(10, True)
+        fm_label = self._get_fm(8)
+        fm_value = self._get_fm(10, True)
+        label_pen = QColor(255, 255, 255, 140 if not self._dimmed else 85)
+        value_pen = QColor(255, 255, 255, 225 if not self._dimmed else 125)
+
+        # CPU：Windows 无可靠的 CPU 温度来源（cpu_temp 恒为 None），
+        # 此时显示同一路采样里真实的 CPU 占用率，而不是一直显示 --
+        cpu_temp = stats.get("cpu_temp")
+        cpu_text = (self._fmt_temp(cpu_temp) if cpu_temp is not None
+                    else self._fmt_percent(stats.get("cpu")))
+        x = unit_x + unit_w + 10
+        groups = (
+            ("CPU", cpu_text),
+            ("GPU", self._fmt_temp(stats.get("gpu_temp"))),
+            ("内存", self._fmt_percent(stats.get("mem"))),
+        )
+        for index, (label, value) in enumerate(groups):
+            if index:
+                x += 12
+            label_w = fm_label.horizontalAdvance(label)
+            painter.setFont(label_font)
+            painter.setPen(label_pen)
+            painter.drawText(QRectF(x, top, label_w + 1, h),
+                             Qt.AlignLeft | Qt.AlignVCenter, label)
+            x += label_w + 3
+            value_w = fm_value.horizontalAdvance(value)
+            painter.setFont(value_font)
+            painter.setPen(value_pen)
+            painter.drawText(QRectF(x, top, value_w + 2, h),
+                             Qt.AlignLeft | Qt.AlignVCenter, value)
+            x += value_w
+
     # --- 下载信息 ---
     def set_download_info(self, info):
         """设置下载信息并触发布局更新
@@ -502,8 +856,12 @@ class DynamicIslandWidget(QWidget):
 
         if now_visible and not old_visible:
             # 新下载开始 / 下载完成：灵动岛标志性展开提示后收回
-            # （蓝牙瞬时通知展示中不改尺寸，避免内容与尺寸错位）
-            if self._bt_event is None:
+            # （剪贴板/蓝牙/日历瞬时通知展示中不改尺寸，避免内容与尺寸错位）
+            if self._clipboard_event is None and self._bt_event is None \
+                    and self._calendar_event is None \
+                    and self._todo_event is None \
+                    and self._code_event is None \
+                    and self._transfer_event is None:
                 self._expand(duration=240)
                 QTimer.singleShot(2200, self._auto_collapse)
         elif now_visible and not old.get("active") and self._state == "collapsed":
@@ -544,6 +902,15 @@ class DynamicIslandWidget(QWidget):
         info: {"name": 设备名, "connected": True/False}
         """
         self._bt_event = info
+
+        # 剪贴板通知展示中（更高优先级）：仅记录，不改尺寸，
+        # 等剪贴板通知收回后经 _collapse 自然露出蓝牙尺寸
+        # （验证码通知优先级最高，同样只记录不抢占）
+        if (self._clipboard_event is not None or self._code_event is not None
+                or self._transfer_event is not None):
+            self._restart_bt_hide_timer()
+            self.update()
+            return
 
         # 打断当前尺寸动画，展开到通知尺寸（灵动岛标志性形变）
         self._state = "hover"
@@ -587,11 +954,526 @@ class DynamicIslandWidget(QWidget):
             self._bt_hide_timer.stop()
         self._dismiss_bluetooth_event()
 
+    # --- Mora 语音助手状态形态（聆听中/思考中/朗读中） ---
+    def set_mora_state(self, info):
+        """Mora 状态变化；info {"state": "listening|thinking|speaking"|None, "name": str}
+
+        state=None 收回。剪贴板/蓝牙瞬时通知展示中仅记录不改尺寸，
+        收回后经 _collapse/_expand 自然露出 Mora 形态。
+        """
+        state = (info or {}).get("state")
+        if state is None:
+            if self._mora_state is None:
+                return
+            self._mora_state = None
+            self._mora_tick.stop()
+            # 被更高优先级瞬时通知压着时不动尺寸
+            if (self._code_event is None and self._clipboard_event is None
+                    and self._bt_event is None
+                    and self._transfer_event is None):
+                if self.underMouse():
+                    self._expand()
+                else:
+                    self._collapse()
+            self.update()
+            return
+        self._mora_state = info
+        if not self._mora_tick.isActive():
+            self._mora_tick.start()
+        # 剪贴板/蓝牙/互传通知展示中：仅记录，不改尺寸
+        if (self._code_event is not None or self._clipboard_event is not None
+                or self._bt_event is not None
+                or self._transfer_event is not None):
+            self.update()
+            return
+        self._state = "hover"
+        self._animate_to(self._mora_state_size, 240)
+        self.update()
+
+    def _on_mora_tick(self):
+        """声波动效帧推进"""
+        if self._mora_state is None:
+            self._mora_tick.stop()
+            return
+        self._mora_wave = (self._mora_wave + 1) % 6
+        self.update()
+
+    def _paint_mora_content(self, painter, rect):
+        """绘制 Mora 状态：左侧圆形衬底 + 声波动效 + 状态标题 + 助手名"""
+        info = self._mora_state or {}
+        state = info.get("state") or "thinking"
+        name = info.get("name") or "Mora"
+        titles = {"listening": "聆听中…", "thinking": "思考中…",
+                  "speaking": "朗读中…"}
+        title = titles.get(state, "思考中…")
+
+        left, top = rect.left(), rect.top()
+        w, h = rect.width(), rect.height()
+        pad = 12
+
+        # 左侧圆形衬底 + 声波动效条（5 根正弦相位错开）
+        icon_d = h - 20
+        cx = left + pad + icon_d / 2
+        cy = top + h / 2
+        circle = QRectF(cx - icon_d / 2, cy - icon_d / 2, icon_d, icon_d)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 28))
+        painter.drawEllipse(circle)
+        painter.setBrush(Qt.NoBrush)
+
+        bars = 5
+        bar_w = 2.0
+        gap = 2.5
+        base_h = icon_d * 0.16
+        total_w = bars * bar_w + (bars - 1) * gap
+        bx = cx - total_w / 2
+        for i in range(bars):
+            phase = (self._mora_wave + i) % 6
+            frac = 0.35 + 0.65 * (1 - abs(phase - 2.5) / 3.0)   # 0.35~1.0
+            bh = base_h * (0.6 + 1.6 * frac)
+            bar = QRectF(bx + i * (bar_w + gap), cy - bh / 2, bar_w, bh)
+            painter.setBrush(QColor(120, 190, 255, 235))
+            painter.drawRoundedRect(bar, bar_w / 2, bar_w / 2)
+        painter.setBrush(Qt.NoBrush)
+
+        # 右侧文字：状态标题（蓝）+ 助手名
+        text_left = left + pad + icon_d + 12
+        text_w = (left + w - pad) - text_left
+        painter.setFont(self._get_font(11, True))
+        painter.setPen(self._col("accent"))
+        painter.drawText(QRectF(text_left, top + h / 2 - 17, text_w, 18),
+                         Qt.AlignLeft | Qt.AlignVCenter, title)
+        painter.setFont(self._get_font(8.5, False))
+        painter.setPen(self._col("text_mid_dim" if self._dimmed else "text_mid"))
+        metrics = self._get_fm(8.5, False)
+        painter.drawText(
+            QRectF(text_left, top + h / 2 + 2, text_w, 14),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            metrics.elidedText(f"{name} · 点击打开对话面板",
+                               Qt.ElideRight, int(text_w)))
+
+    # --- 日历下一条日程临近提醒 ---
+    CAL_TOAST_MS = 5000  # 临近提醒展示 5 秒
+
+    def set_calendar_event(self, info):
+        """下一条日程临近时弹出通知，数秒后自动收回
+
+        info: {"subject", "start", "end", "location", "entry_id", "all_day"}
+        """
+        self._calendar_open_id = info.get("entry_id")
+        self._calendar_event = info
+
+        # 优先级更高的瞬时通知展示中（验证码 / 剪贴板 / 蓝牙）：仅记录不改尺寸，
+        # 等其收回后经 _collapse/_expand 自然露出日历形态
+        if (self._code_event is not None or self._clipboard_event is not None
+                or self._bt_event is not None
+                or self._transfer_event is not None):
+            self._restart_cal_hide_timer()
+            self.update()
+            return
+
+        # 打断当前尺寸动画，展开到通知尺寸（灵动岛标志性形变）
+        self._state = "hover"
+        self._animate_to(self._calendar_notify_size, 320)
+
+        # 图标从 0.35 倍回弹放大
+        self._cal_pop_anim.stop()
+        self._cal_pop_anim.setStartValue(0.35)
+        self._cal_pop_anim.setEndValue(1.0)
+        self._cal_pop_anim.start()
+
+        # 连续事件以最后一次为准重新计时
+        self._restart_cal_hide_timer()
+        self.update()
+
+    def _restart_cal_hide_timer(self):
+        """复用日历隐藏定时器（避免每次通知创建新 QTimer 导致泄漏）"""
+        if self._cal_hide_timer is None:
+            self._cal_hide_timer = QTimer(self)
+            self._cal_hide_timer.setSingleShot(True)
+            self._cal_hide_timer.timeout.connect(self._dismiss_calendar_event)
+        else:
+            self._cal_hide_timer.stop()
+        self._cal_hide_timer.start(self.CAL_TOAST_MS)
+
+    def _dismiss_calendar_event(self):
+        """通知展示结束，回到正常形态"""
+        if self._calendar_event is None:
+            return
+        self._calendar_event = None
+        self._calendar_open_id = None
+        self._cal_hide_timer = None
+        if self.underMouse():
+            self._expand()
+        else:
+            self._collapse()
+        self.update()
+
+    def is_calendar_notifying(self):
+        """日历通知是否正在展示（点击时打开 Outlook 约会）
+
+        只在日历通知真正可见（更高优先级的剪贴板 / 蓝牙均未展示）时返回 True。
+        """
+        return (self._calendar_event is not None
+                and self._clipboard_event is None
+                and self._bt_event is None
+                and self._code_event is None
+                and self._transfer_event is None)
+
+    def dismiss_calendar_event(self):
+        """立即收回日历通知（如点击打开 Outlook 后）"""
+        if self._cal_hide_timer is not None:
+            self._cal_hide_timer.stop()
+        self._dismiss_calendar_event()
+
+    # --- 待办到点提醒 ---
+    TODO_TOAST_MS = 6000  # 到点提醒展示 6 秒
+
+    def set_todo_event(self, info):
+        """待办到点弹出提醒，数秒后自动收回
+
+        info: {"id", "text", "remindAt"}
+        """
+        self._todo_event = info
+
+        # 优先级更高的瞬时通知展示中（验证码 / 互传 / 剪贴板 / 蓝牙 / 日历）：
+        # 仅记录不改尺寸，等其收回后经 _collapse/_expand 自然露出待办形态
+        if (self._code_event is not None or self._transfer_event is not None
+                or self._clipboard_event is not None
+                or self._bt_event is not None
+                or self._calendar_event is not None):
+            self._restart_todo_hide_timer()
+            self.update()
+            return
+
+        # 打断当前尺寸动画，展开到通知尺寸（灵动岛标志性形变）
+        self._state = "hover"
+        self._animate_to(self._todo_notify_size, 320)
+
+        # 图标从 0.35 倍回弹放大
+        self._todo_pop_anim.stop()
+        self._todo_pop_anim.setStartValue(0.35)
+        self._todo_pop_anim.setEndValue(1.0)
+        self._todo_pop_anim.start()
+
+        # 连续事件以最后一次为准重新计时
+        self._restart_todo_hide_timer()
+        self.update()
+
+    def _restart_todo_hide_timer(self):
+        """复用待办隐藏定时器（避免每次通知创建新 QTimer 导致泄漏）"""
+        if self._todo_hide_timer is None:
+            self._todo_hide_timer = QTimer(self)
+            self._todo_hide_timer.setSingleShot(True)
+            self._todo_hide_timer.timeout.connect(self._dismiss_todo_event)
+        else:
+            self._todo_hide_timer.stop()
+        self._todo_hide_timer.start(self.TODO_TOAST_MS)
+
+    def _dismiss_todo_event(self):
+        """提醒展示结束，回到正常形态"""
+        if self._todo_event is None:
+            return
+        self._todo_event = None
+        self._todo_hide_timer = None
+        if self.underMouse():
+            self._expand()
+        else:
+            self._collapse()
+        self.update()
+
+    def is_todo_notifying(self):
+        """待办提醒是否正在展示（点击时打开控制台待办页）
+
+        只在更高优先级的通知均未展示时返回 True。
+        """
+        return (self._todo_event is not None
+                and self._code_event is None
+                and self._transfer_event is None
+                and self._clipboard_event is None
+                and self._bt_event is None
+                and self._calendar_event is None)
+
+    def dismiss_todo_event(self):
+        """立即收回待办提醒（如点击打开待办页后）"""
+        if self._todo_hide_timer is not None:
+            self._todo_hide_timer.stop()
+        self._dismiss_todo_event()
+
+    # --- Teams/微信通话状态 ---
+    CALL_END_TOAST_MS = 3200  # 挂断后"通话结束"展示时长
+
+    def set_call_info(self, info):
+        """通话开始/结束（检测与计时在后端），岛负责形变与展示
+
+        info 开始: {active:True, app, app_name, started_at}
+        info 结束: {active:False, app, app_name, started_at, ended_at, elapsed}
+        """
+        active = bool(info and info.get("active"))
+        was_active = bool(self._call_info and self._call_info.get("active"))
+        transient = (self._code_event is not None
+                     or self._clipboard_event is not None
+                     or self._bt_event is not None
+                     or self._calendar_event is not None
+                     or self._transfer_event is not None)
+
+        if active:
+            self._call_info = info
+            if self._call_end_timer is not None:
+                self._call_end_timer.stop()
+                self._call_end_timer = None
+            if not self._call_tick_timer.isActive():
+                self._call_tick_timer.start()
+
+            if transient:
+                # 更高优先级瞬时通知展示中：仅记录，收回后自然露出通话形态
+                self.update()
+                return
+            if not was_active:
+                # 灵动岛标志性形变：弹出到展开态，2.2s 后自动收起到计时形态
+                self._state = "hover"
+                self._animate_to(self._call_hover_size, 320)
+                self._call_pop_anim.stop()
+                self._call_pop_anim.setStartValue(0.35)
+                self._call_pop_anim.setEndValue(1.0)
+                self._call_pop_anim.start()
+                QTimer.singleShot(2200, self._auto_collapse)
+            self.update()
+            return
+
+        # --- 通话结束：短暂展示"通话结束 + 时长"后收回 ---
+        if self._call_info is None:
+            return
+        if not info.get("app_name"):
+            info["app_name"] = self._call_info.get("app_name")
+        self._call_info = info
+        if self._call_tick_timer.isActive():
+            self._call_tick_timer.stop()
+
+        # 结束提示计时独立于当前是否被瞬时通知遮挡
+        if self._call_end_timer is None:
+            self._call_end_timer = QTimer(self)
+            self._call_end_timer.setSingleShot(True)
+            self._call_end_timer.timeout.connect(self._dismiss_call_event)
+        else:
+            self._call_end_timer.stop()
+        self._call_end_timer.start(self.CALL_END_TOAST_MS)
+
+        if not transient:
+            # 从展开态收落到通话尺寸（收起态已是该尺寸时无视觉跳变）
+            self._state = "collapsed"
+            self._animate_to(self._call_active_size, 240)
+        self.update()
+
+    def _dismiss_call_event(self):
+        """结束提示展示完毕，回到正常形态"""
+        if self._call_info is None:
+            return
+        self._call_info = None
+        self._call_end_timer = None
+        if self._call_tick_timer.isActive():
+            self._call_tick_timer.stop()
+        if self.underMouse():
+            self._expand()
+        else:
+            self._collapse()
+        self.update()
+
+    def is_call_active(self):
+        """通话是否正在进行（不含挂断后的结束提示）"""
+        return bool(self._call_info and self._call_info.get("active"))
+
+    def clear_call_state(self):
+        """清除通话状态（通知关闭时调用）"""
+        self._call_info = None
+        self._call_end_timer = None
+        if self._call_tick_timer.isActive():
+            self._call_tick_timer.stop()
+        self.update()
+
+    @staticmethod
+    def _fmt_elapsed(seconds):
+        """秒 -> mm:ss（满 1 小时用 h:mm:ss）"""
+        seconds = max(0, int(seconds))
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    def _call_elapsed(self):
+        """当前通话已进行秒数（结束提示里用后端给出的最终 elapsed）"""
+        info = self._call_info or {}
+        if not info.get("active"):
+            return int(info.get("elapsed") or 0)
+        import time as _time
+        return max(0, int(_time.time() - float(info.get("started_at") or 0)))
+
+    # --- 剪贴板复制通知 ---
+    CLIP_TOAST_MS = 2600  # 普通内容展示时长
+    CLIP_URL_TOAST_MS = 3400  # 链接（带"打开"按钮）展示时长
+
+    def set_clipboard_event(self, info):
+        """复制内容时轻弹通知，数秒后自动收回
+
+        info: {"kind": text|url|file|image, "preview": ..., "url": 链接时有}
+        """
+        self._clipboard_open_url = info.get("url")
+        repeated = self._clipboard_event is not None
+        if info.get("kind") == "image" and info.get("image") is not None \
+                and "pixmap" not in info:
+            info["pixmap"] = QPixmap.fromImage(info["image"])
+        self._clipboard_event = info
+
+        if (not repeated and self._code_event is None
+                and self._transfer_event is None):
+            # 打断当前尺寸动画，轻弹到通知尺寸（灵动岛标志性形变）
+            # （验证码/互传通知优先级最高，展示期间不改尺寸）
+            self._state = "hover"
+            self._animate_to(self._clipboard_notify_size, 260)
+
+            # 图标从 0.35 倍回弹放大
+            self._clip_pop_anim.stop()
+            self._clip_pop_anim.setStartValue(0.35)
+            self._clip_pop_anim.setEndValue(1.0)
+            self._clip_pop_anim.start()
+
+        # 连续复制时以最后一次为准重新计时
+        ms = self.CLIP_URL_TOAST_MS if info.get("url") else self.CLIP_TOAST_MS
+        if self._clip_hide_timer is None:
+            self._clip_hide_timer = QTimer(self)
+            self._clip_hide_timer.setSingleShot(True)
+            self._clip_hide_timer.timeout.connect(self._dismiss_clipboard_event)
+        else:
+            self._clip_hide_timer.stop()
+        self._clip_hide_timer.start(ms)
+        self.update()
+
+    def is_clipboard_notifying(self):
+        """剪贴板通知是否正在展示（胶囊点击此时打开历史面板）"""
+        return self._clipboard_event is not None
+
+    def dismiss_clipboard_event(self):
+        """立即收回剪贴板通知（如点击"打开"后）"""
+        if self._clip_hide_timer is not None:
+            self._clip_hide_timer.stop()
+        self._dismiss_clipboard_event()
+
+    def _dismiss_clipboard_event(self):
+        """通知展示结束，回到正常形态"""
+        if self._clipboard_event is None:
+            return
+        self._clipboard_event = None
+        self._clipboard_open_url = None
+        self._clip_hide_timer = None
+        self._clip_scaled_pixmap = None
+        self._clip_scaled_pixmap_key = None
+        if self.underMouse():
+            self._expand()
+        else:
+            self._collapse()
+        self.update()
+
+    # --- 验证码通知（点击复制） ---
+    CODE_TOAST_MS = 6000  # 验证码展示时长（留足输入时间）
+    CODE_COPIED_MS = 1400  # "已复制"反馈停留时长
+
+    def set_code_event(self, info):
+        """弹出验证码通知：来源 + 验证码，点击整块复制
+
+        info: {"code": "832941", "source": "QQ邮箱"}
+        """
+        repeated = self._code_event is not None
+        self._code_event = info
+        self._code_copied = False
+        if not repeated:
+            self._state = "hover"
+            self._animate_to(self._code_notify_size, 260)
+        self._restart_code_hide_timer(self.CODE_TOAST_MS)
+        self.update()
+
+    def _restart_code_hide_timer(self, ms):
+        if self._code_hide_timer is None:
+            self._code_hide_timer = QTimer(self)
+            self._code_hide_timer.setSingleShot(True)
+            self._code_hide_timer.timeout.connect(self._dismiss_code_event)
+        else:
+            self._code_hide_timer.stop()
+        self._code_hide_timer.start(ms)
+
+    def _dismiss_code_event(self):
+        if self._code_event is None:
+            return
+        self._code_event = None
+        self._code_copied = False
+        self._code_hide_timer = None
+        if self.underMouse():
+            self._expand()
+        else:
+            self._collapse()
+        self.update()
+
+    def dismiss_code_event(self):
+        """立即收回验证码通知"""
+        if self._code_hide_timer is not None:
+            self._code_hide_timer.stop()
+        self._dismiss_code_event()
+
+    def mark_code_copied(self):
+        """复制成功后切换为"已复制"反馈，并缩短停留时间"""
+        if self._code_event is None:
+            return
+        self._code_copied = True
+        self._restart_code_hide_timer(self.CODE_COPIED_MS)
+        self.update()
+
+    def is_code_notifying(self):
+        """验证码通知是否正在展示"""
+        return self._code_event is not None
+
+    # --- 手机互传完成提示（点击打开接收目录） ---
+    TRANSFER_TOAST_MS = 5200
+
+    def set_transfer_event(self, info):
+        """手机传完文件时轻弹提示；info: {"name","size","count","dir"}"""
+        if not info:
+            return
+        self._transfer_event = info
+        if self._code_event is None:
+            self._state = "hover"
+            self._animate_to(self._transfer_notify_size, 260)
+        self._restart_transfer_hide_timer(self.TRANSFER_TOAST_MS)
+        self.update()
+
+    def _restart_transfer_hide_timer(self, ms):
+        if self._transfer_hide_timer is None:
+            self._transfer_hide_timer = QTimer(self)
+            self._transfer_hide_timer.setSingleShot(True)
+            self._transfer_hide_timer.timeout.connect(self._dismiss_transfer_event)
+        else:
+            self._transfer_hide_timer.stop()
+        self._transfer_hide_timer.start(ms)
+
+    def _dismiss_transfer_event(self):
+        if self._transfer_event is None:
+            return
+        self._transfer_event = None
+        self._transfer_hide_timer = None
+        if self.underMouse():
+            self._expand()
+        else:
+            self._collapse()
+        self.update()
+
+    def is_transfer_notifying(self):
+        """互传完成提示是否正在展示"""
+        return self._transfer_event is not None
+
     # --- 硬件高负载告警 ---
     def set_hw_alert(self, active, stats):
         """高负载开始/结束（阈值+迟滞在后端），岛负责形变与通知互斥
 
-        蓝牙瞬时通知展示中只记录不改尺寸，通知收回时经
+        验证码/剪贴板/蓝牙瞬时通知展示中只记录不改尺寸，通知收回时经
         _collapse/_expand 自然露出（或离开）硬件形态。
         """
         old = self._hw_alert
@@ -601,7 +1483,12 @@ class DynamicIslandWidget(QWidget):
         if active == old:
             self.update()
             return
-        if self._bt_event is not None:
+        if (self._code_event is not None
+                or self._clipboard_event is not None
+                or self._bt_event is not None
+                or self._calendar_event is not None
+                or self._call_info is not None
+                or self._transfer_event is not None):
             self.update()
             return
 
@@ -729,19 +1616,10 @@ class DynamicIslandWidget(QWidget):
 
     # --- 绘制 ---
     def paintEvent(self, event):
-        # 静态背景（阴影 + 圆角矩形 + 高光 + 描边）尺寸/调光未变时直接 blit 缓存，
-        # 避免每帧重建 QPainterPath / QLinearGradient / 高斯模糊（原 QGraphicsDropShadowEffect）
-        w = int(self.width())
-        h = int(self.height())
-        key = (w, h, round(self._animated_width, 2),
-               round(self._animated_height, 2), self._dimmed)
-        if self._bg_pixmap is None or self._bg_key != key:
-            self._rebuild_bg_cache()
-
+        # 背景直接绘制（无离屏 pixmap 缓存），动画期间不产生每帧分配开销
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        if self._bg_pixmap is not None:
-            painter.drawPixmap(0, 0, self._bg_pixmap)
+        self._paint_background(painter)
 
         m = self._shadow_margin
         rect = QRectF(m, m, self._animated_width, self._animated_height)
@@ -750,15 +1628,35 @@ class DynamicIslandWidget(QWidget):
         # （_paint_control_buttons 绘制音乐按钮时会重新填充）
         self._control_zones = {}
 
-        # 内容（优先级：蓝牙通知 > 硬件告警 > 下载 > 音乐 > 默认）
-        if self._bt_event is not None:
+        # 内容（优先级：验证码 > 互传完成 > 剪贴板 > 蓝牙通知 > 日历通知 > 待办提醒 > 通话 > Mora > 硬件告警 > 游戏帧率 > 下载 > 音乐 > 默认）
+        if self._code_event is not None:
+            self._paint_code_content(painter, rect)
+        elif self._transfer_event is not None:
+            self._paint_transfer_content(painter, rect)
+        elif self._clipboard_event is not None:
+            self._paint_clipboard_content(painter, rect)
+        elif self._bt_event is not None:
             self._paint_bt_content(painter, rect)
+        elif self._calendar_event is not None:
+            self._paint_calendar_content(painter, rect)
+        elif self._todo_event is not None:
+            self._paint_todo_content(painter, rect)
+        elif self._call_info is not None:
+            self._paint_call_content(painter, rect)
+        elif self._mora_state is not None:
+            self._paint_mora_content(painter, rect)
         elif self._hw_alert:
             self._paint_hw_content(painter, rect)
+        elif self._game_fps_visible():
+            self._paint_game_fps_content(painter, rect)
         elif self._download_visible():
             self._paint_download_content(painter, rect)
         elif self._music_info and self._music_info.get("title"):
-            self._paint_music_content(painter, rect)
+            # 视频形态与音乐互斥，由 media_type 决定
+            if self._music_info.get("media_type") == "video":
+                self._paint_video_content(painter, rect)
+            else:
+                self._paint_music_content(painter, rect)
         else:
             self._paint_default_content(painter, rect)
 
@@ -839,6 +1737,573 @@ class DynamicIslandWidget(QWidget):
             QRectF(text_left, top + h / 2 + 2, text_w, 14),
             Qt.AlignLeft | Qt.AlignVCenter,
             metrics.elidedText(name, Qt.ElideRight, int(text_w)))
+
+    # --- 日历临近提醒绘制 ---
+    def _paint_calendar_content(self, painter, rect):
+        """绘制日历通知：圆形日历图标 + 标题 + 时间/地点 + 右侧"›"打开提示"""
+        from datetime import datetime, timedelta
+        info = self._calendar_event or {}
+        subject = info.get("subject") or "(无标题)"
+        location = info.get("location") or ""
+        start = info.get("start")
+        end = info.get("end")
+        all_day = bool(info.get("all_day"))
+
+        left, top = rect.left(), rect.top()
+        w, h = rect.width(), rect.height()
+        pad = 12
+
+        # 左侧圆形衬底 + 日历图标（图标带弹出缩放）
+        icon_d = h - 20
+        cx = left + pad + icon_d / 2
+        cy = top + h / 2
+        circle = QRectF(cx - icon_d / 2, cy - icon_d / 2, icon_d, icon_d)
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 30))
+        painter.drawEllipse(circle)
+        painter.setBrush(Qt.NoBrush)
+
+        side = icon_d * 0.5 * max(0.0, self._cal_icon_scale)
+        if side > 1:
+            pm = self._get_icon_pixmap("日历", side)
+            if pm is not None:
+                painter.drawPixmap(QRectF(cx - side / 2, cy - side / 2,
+                                          side, side), pm, QRectF(pm.rect()))
+
+        # 右侧"›"打开提示（点击通知任意位置可在 Outlook 中打开该约会）
+        hint_x = left + w - pad
+        hint_font = painter.font()
+        hint_font.setPointSize(14)
+        hint_font.setBold(True)
+        painter.setFont(hint_font)
+        painter.setPen(QColor(255, 255, 255, 140 if not self._dimmed else 90))
+        painter.drawText(QRectF(hint_x - 16, top, 16, h),
+                         Qt.AlignRight | Qt.AlignVCenter, "›")
+
+        # 文字区
+        text_left = left + pad + icon_d + 12
+        text_right = hint_x - 18
+        text_w = text_right - text_left
+
+        # 时间文案
+        now = datetime.now()
+        if start is not None and end is not None:
+            if all_day:
+                if start.date() == now.date():
+                    time_text = "今天全天"
+                elif start.date() == (now + timedelta(days=1)).date():
+                    time_text = "明天全天"
+                else:
+                    time_text = start.strftime("%m-%d") + " 全天"
+            elif end < now:
+                time_text = "已结束"
+            elif start <= now <= end:
+                time_text = "进行中"
+            else:
+                secs = (start - now).total_seconds()
+                mins = int(secs // 60)
+                if mins < 1:
+                    time_text = "即将开始"
+                elif mins < 60:
+                    time_text = f"{mins} 分钟后"
+                else:
+                    hours = mins // 60
+                    if hours < 24:
+                        mins_remain = mins % 60
+                        time_text = (f"{hours} 小时后"
+                                     if mins_remain == 0
+                                     else f"{hours} 小时 {mins_remain} 分后")
+                    else:
+                        time_text = start.strftime("%m-%d %H:%M")
+        else:
+            time_text = ""
+
+        # 标题
+        has_sub = bool(time_text or location)
+        title_font = painter.font()
+        title_font.setPointSize(11)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.setPen(QColor(255, 255, 255, 235 if not self._dimmed else 140))
+        metrics = QFontMetrics(title_font)
+        if has_sub:
+            painter.drawText(QRectF(text_left, top + h / 2 - 17, text_w, 18),
+                             Qt.AlignLeft | Qt.AlignVCenter,
+                             metrics.elidedText(subject, Qt.ElideRight,
+                                                int(text_w)))
+        else:
+            painter.drawText(QRectF(text_left, top, text_w, h),
+                             Qt.AlignLeft | Qt.AlignVCenter,
+                             metrics.elidedText(subject, Qt.ElideRight,
+                                                int(text_w)))
+
+        # 副标题：时间 · 地点
+        if has_sub:
+            sub_font = painter.font()
+            sub_font.setPointSize(8.5)
+            sub_font.setBold(False)
+            painter.setFont(sub_font)
+            painter.setPen(QColor(255, 255, 255, 165 if not self._dimmed else 100))
+            sub_metrics = QFontMetrics(sub_font)
+            sub_text = time_text
+            if location:
+                sub_text = (sub_text + " · " + location) if sub_text else location
+            painter.drawText(
+                QRectF(text_left, top + h / 2 + 2, text_w, 14),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                sub_metrics.elidedText(sub_text, Qt.ElideRight, int(text_w)))
+
+    # --- 待办到点提醒绘制 ---
+    def _paint_todo_content(self, painter, rect):
+        """绘制待办提醒：圆形时钟图标 + 待办内容 + 提醒时间 + 右侧"›"打开提示"""
+        from datetime import datetime
+        info = self._todo_event or {}
+        text = info.get("text") or "待办事项"
+        ts = info.get("remindAt")
+
+        left, top = rect.left(), rect.top()
+        w, h = rect.width(), rect.height()
+        pad = 12
+
+        # 左侧圆形衬底 + 时钟图标（图标带弹出缩放）
+        icon_d = h - 20
+        cx = left + pad + icon_d / 2
+        cy = top + h / 2
+        circle = QRectF(cx - icon_d / 2, cy - icon_d / 2, icon_d, icon_d)
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 30))
+        painter.drawEllipse(circle)
+        painter.setBrush(Qt.NoBrush)
+
+        side = icon_d * 0.5 * max(0.0, self._todo_icon_scale)
+        if side > 1:
+            pm = self._get_icon_pixmap("提醒", side)
+            if pm is not None:
+                painter.drawPixmap(QRectF(cx - side / 2, cy - side / 2,
+                                          side, side), pm, QRectF(pm.rect()))
+
+        # 右侧"›"打开提示（点击整块在控制台待办页打开）
+        hint_x = left + w - pad
+        hint_font = painter.font()
+        hint_font.setPointSize(14)
+        hint_font.setBold(True)
+        painter.setFont(hint_font)
+        painter.setPen(QColor(255, 255, 255, 140 if not self._dimmed else 90))
+        painter.drawText(QRectF(hint_x - 16, top, 16, h),
+                         Qt.AlignRight | Qt.AlignVCenter, "›")
+
+        # 文字区
+        text_left = left + pad + icon_d + 12
+        text_w = (hint_x - 18) - text_left
+
+        time_text = ""
+        if ts:
+            try:
+                dt = datetime.fromtimestamp(int(ts) / 1000)
+                if dt.date() == datetime.now().date():
+                    time_text = dt.strftime("%H:%M")
+                else:
+                    time_text = dt.strftime("%m-%d %H:%M")
+            except (TypeError, ValueError, OSError):
+                time_text = ""
+
+        title_font = painter.font()
+        title_font.setPointSize(11)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.setPen(QColor(255, 255, 255, 235 if not self._dimmed else 140))
+        metrics = QFontMetrics(title_font)
+        painter.drawText(QRectF(text_left, top + h / 2 - 17, text_w, 18),
+                         Qt.AlignLeft | Qt.AlignVCenter,
+                         metrics.elidedText(text, Qt.ElideRight, int(text_w)))
+
+        if time_text:
+            sub_font = painter.font()
+            sub_font.setPointSize(8.5)
+            sub_font.setBold(False)
+            painter.setFont(sub_font)
+            painter.setPen(QColor(255, 255, 255, 165 if not self._dimmed else 100))
+            sub_metrics = QFontMetrics(sub_font)
+            painter.drawText(
+                QRectF(text_left, top + h / 2 + 2, text_w, 14),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                sub_metrics.elidedText(f"提醒 {time_text}",
+                                       Qt.ElideRight, int(text_w)))
+
+    # --- 通话状态绘制 ---
+    def _paint_call_content(self, painter, rect):
+        """绘制 Teams/微信通话：电话图标(+绿点) + App 名/状态 + 通话时长"""
+        info = self._call_info or {}
+        active = bool(info.get("active"))
+        app_name = info.get("app_name") or "语音通话"
+        time_text = self._fmt_elapsed(self._call_elapsed())
+
+        left, top = rect.left(), rect.top()
+        w, h = rect.width(), rect.height()
+        pad = 12
+
+        # 左侧圆形衬底 + 电话图标（挂断后的结束提示里图标半透明）
+        icon_d = h - 14
+        cx = left + pad + icon_d / 2
+        cy = top + h / 2
+        circle = QRectF(cx - icon_d / 2, cy - icon_d / 2, icon_d, icon_d)
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 30 if active else 20))
+        painter.drawEllipse(circle)
+        painter.setBrush(Qt.NoBrush)
+
+        side = icon_d * 0.52 * max(0.0, self._call_icon_scale)
+        if side > 1:
+            pm = self._get_icon_pixmap("通话", side)
+            if pm is not None:
+                painter.save()
+                if not active:
+                    painter.setOpacity(0.55)
+                painter.drawPixmap(QRectF(cx - side / 2, cy - side / 2,
+                                          side, side), pm, QRectF(pm.rect()))
+                painter.restore()
+
+        if active:
+            # 图标右下角绿色圆点：麦克风占用中（与系统麦克风指示灯同义）
+            dot_d = 8.5
+            dx = cx + icon_d / 2 - dot_d + 2
+            dy = cy + icon_d / 2 - dot_d + 2
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(10, 10, 12, 235))  # 深色描边圈
+            painter.drawEllipse(QRectF(dx - 1.0, dy - 1.0,
+                                       dot_d + 2.0, dot_d + 2.0))
+            painter.setBrush(QColor(48, 209, 88))
+            painter.drawEllipse(QRectF(dx, dy, dot_d, dot_d))
+            painter.setBrush(Qt.NoBrush)
+
+        text_left = left + pad + icon_d + 10
+        text_right = left + w - pad
+        dim_alpha = 230 if not self._dimmed else 130
+
+        if self._state == "hover":
+            # 右侧大号计时
+            time_w = 88.0
+            timer_font = painter.font()
+            timer_font.setPointSize(15)
+            timer_font.setBold(True)
+            painter.setFont(timer_font)
+            painter.setPen(QColor(48, 209, 88) if active
+                           else QColor(255, 255, 255, dim_alpha))
+            painter.drawText(QRectF(text_right - time_w, top, time_w, h),
+                             Qt.AlignRight | Qt.AlignVCenter, time_text)
+
+            col_w = (text_right - time_w - 10) - text_left
+            title = app_name if active else "通话结束"
+            title_font = painter.font()
+            title_font.setPointSize(11)
+            title_font.setBold(True)
+            painter.setFont(title_font)
+            painter.setPen(QColor(255, 255, 255, dim_alpha) if active
+                           else QColor(255, 128, 128))
+            metrics = QFontMetrics(title_font)
+            painter.drawText(QRectF(text_left, top + h / 2 - 17, col_w, 18),
+                             Qt.AlignLeft | Qt.AlignVCenter,
+                             metrics.elidedText(title, Qt.ElideRight,
+                                                int(col_w)))
+
+            sub_font = painter.font()
+            sub_font.setPointSize(8.5)
+            sub_font.setBold(False)
+            painter.setFont(sub_font)
+            painter.setPen(QColor(255, 255, 255,
+                                  165 if not self._dimmed else 100))
+            sub_text = "麦克风使用中" if active else app_name
+            painter.drawText(QRectF(text_left, top + h / 2 + 2, col_w, 14),
+                             Qt.AlignLeft | Qt.AlignVCenter,
+                             QFontMetrics(sub_font).elidedText(
+                                 sub_text, Qt.ElideRight, int(col_w)))
+        else:
+            # 收起态：标题 + 右侧计时
+            time_w = 64.0
+            timer_font = painter.font()
+            timer_font.setPointSize(12)
+            timer_font.setBold(True)
+            painter.setFont(timer_font)
+            painter.setPen(QColor(48, 209, 88) if active
+                           else QColor(255, 255, 255, dim_alpha))
+            painter.drawText(QRectF(text_right - time_w, top, time_w, h),
+                             Qt.AlignRight | Qt.AlignVCenter, time_text)
+
+            col_w = (text_right - time_w - 8) - text_left
+            title = app_name if active else "通话结束"
+            title_font = painter.font()
+            title_font.setPointSize(10)
+            title_font.setBold(True)
+            painter.setFont(title_font)
+            painter.setPen(QColor(255, 255, 255, dim_alpha) if active
+                           else QColor(255, 128, 128))
+            metrics = QFontMetrics(title_font)
+            painter.drawText(QRectF(text_left, top, col_w, h),
+                             Qt.AlignLeft | Qt.AlignVCenter,
+                             metrics.elidedText(title, Qt.ElideRight,
+                                                int(col_w)))
+
+    # --- 验证码通知绘制 ---
+    def _paint_code_content(self, painter, rect):
+        """绘制验证码通知：锁形图标 + 来源 + 右侧大号验证码（整块可点击复制）"""
+        info = self._code_event or {}
+        source = info.get("source") or "通知"
+        code = info.get("code") or ""
+        copied = self._code_copied
+
+        left, top = rect.left(), rect.top()
+        w, h = rect.width(), rect.height()
+        pad = 12
+
+        # 整块都是"点击复制"热区
+        self._control_zones["copy_code"] = QRect(
+            int(rect.left()), int(rect.top()), int(w), int(h))
+
+        # 左侧圆形衬底 + 锁图标
+        icon_d = h - 20
+        cx = left + pad + icon_d / 2
+        cy = top + h / 2
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 30))
+        painter.drawEllipse(QRectF(cx - icon_d / 2, cy - icon_d / 2,
+                                   icon_d, icon_d))
+        painter.setBrush(Qt.NoBrush)
+
+        side = icon_d * 0.52
+        pm = self._get_icon_pixmap("上锁", side)
+        if pm is not None:
+            painter.drawPixmap(QRectF(cx - side / 2, cy - side / 2,
+                                      side, side), pm, QRectF(pm.rect()))
+
+        # 右侧验证码胶囊
+        code_font = painter.font()
+        code_font.setPointSize(15)
+        code_font.setBold(True)
+        if hasattr(code_font, "setFamilies"):
+            code_font.setFamilies(["Consolas", "Cascadia Mono", "Microsoft YaHei UI"])
+        code_metrics = QFontMetrics(code_font)
+        block_w = max(78.0, float(code_metrics.horizontalAdvance(code)) + 22.0)
+        block_h = 30.0
+        block = QRectF(left + w - pad - block_w, cy - block_h / 2,
+                       block_w, block_h)
+
+        pill = QPainterPath()
+        pill.addRoundedRect(block, 8, 8)
+        if copied:
+            painter.fillPath(pill, QColor(48, 209, 88, 40))
+        else:
+            painter.fillPath(pill, QColor(255, 255, 255, 26))
+
+        painter.setFont(code_font)
+        painter.setPen(QColor(48, 209, 88) if copied
+                       else QColor(255, 214, 102))
+        painter.drawText(block, Qt.AlignCenter, code)
+
+        # 左侧文字：来源 + 操作提示
+        text_left = left + pad + icon_d + 10
+        text_right = block.left() - 10
+        text_w = max(40.0, text_right - text_left)
+
+        title_font = painter.font()
+        title_font.setPointSize(10.5)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.setPen(QColor(255, 255, 255, 230 if not self._dimmed else 130))
+        painter.drawText(
+            QRectF(text_left, top + h / 2 - 17, text_w, 18),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            QFontMetrics(title_font).elidedText(source, Qt.ElideRight,
+                                                int(text_w)))
+
+        sub_font = painter.font()
+        sub_font.setPointSize(8.5)
+        sub_font.setBold(False)
+        painter.setFont(sub_font)
+        painter.setPen(QColor(48, 209, 88) if copied
+                       else QColor(255, 255, 255, 165 if not self._dimmed else 100))
+        painter.drawText(QRectF(text_left, top + h / 2 + 2, text_w, 14),
+                         Qt.AlignLeft | Qt.AlignVCenter,
+                         "已复制 ✓" if copied else "验证码 · 点击复制")
+
+    # --- 手机互传完成提示绘制 ---
+    @staticmethod
+    def _fmt_size(num):
+        try:
+            num = float(num)
+        except (TypeError, ValueError):
+            return "--"
+        for unit in ("B", "KB", "MB", "GB"):
+            if num < 1024 or unit == "GB":
+                return f"{num:.1f} {unit}" if unit != "B" else f"{int(num)} B"
+            num /= 1024.0
+        return f"{num:.1f} GB"
+
+    def _paint_transfer_content(self, painter, rect):
+        """绘制互传完成提示：下载图标 + 文件名 + 右侧「打开」按钮"""
+        info = self._transfer_event or {}
+        name = info.get("name") or "文件"
+        count = int(info.get("count") or 1)
+        size = info.get("size") or 0
+        action = info.get("action") or "打开"
+
+        left, top = rect.left(), rect.top()
+        w, h = rect.width(), rect.height()
+        pad = 12
+
+        self._control_zones["open_transfer"] = QRect(
+            int(rect.left()), int(rect.top()), int(w), int(h))
+
+        icon_d = h - 20
+        cx = left + pad + icon_d / 2
+        cy = top + h / 2
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 30))
+        painter.drawEllipse(QRectF(cx - icon_d / 2, cy - icon_d / 2,
+                                   icon_d, icon_d))
+        painter.setBrush(Qt.NoBrush)
+
+        side = icon_d * 0.52
+        pm = self._get_icon_pixmap("下载", side)
+        if pm is not None:
+            painter.drawPixmap(QRectF(cx - side / 2, cy - side / 2,
+                                      side, side), pm, QRectF(pm.rect()))
+
+        # 右侧「打开」胶囊
+        btn_font = painter.font()
+        btn_font.setPointSize(9.5)
+        btn_font.setBold(True)
+        btn_metrics = QFontMetrics(btn_font)
+        block_w = float(btn_metrics.horizontalAdvance(action)) + 26.0
+        block = QRectF(left + w - pad - block_w, cy - 14, block_w, 28)
+        pill = QPainterPath()
+        pill.addRoundedRect(block, 8, 8)
+        painter.fillPath(pill, QColor(76, 154, 255, 40))
+        painter.setFont(btn_font)
+        painter.setPen(QColor(76, 154, 255))
+        painter.drawText(block, Qt.AlignCenter, action)
+
+        # 左侧文字：标题 + 文件信息
+        text_left = left + pad + icon_d + 10
+        text_w = max(40.0, block.left() - 10 - text_left)
+        title_font = painter.font()
+        title_font.setPointSize(10.5)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.setPen(QColor(255, 255, 255, 230 if not self._dimmed else 130))
+        painter.drawText(
+            QRectF(text_left, top + h / 2 - 17, text_w, 18),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            QFontMetrics(title_font).elidedText(
+                info.get("title") or
+                (f"手机互传 · {count} 个文件" if count > 1 else "手机互传"),
+                Qt.ElideRight, int(text_w)))
+
+        sub_font = painter.font()
+        sub_font.setPointSize(8.5)
+        sub_font.setBold(False)
+        painter.setFont(sub_font)
+        painter.setPen(QColor(255, 255, 255, 165 if not self._dimmed else 100))
+        painter.drawText(
+            QRectF(text_left, top + h / 2 + 2, text_w, 14),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            QFontMetrics(sub_font).elidedText(
+                info.get("subtitle") or f"{name} · {self._fmt_size(size)}",
+                Qt.ElideMiddle, int(text_w)))
+
+    # --- 剪贴板复制通知绘制 ---
+    def _paint_clipboard_content(self, painter, rect):
+        """绘制复制通知：圆形图标 + 内容预览（链接时右侧带"打开"按钮）"""
+        info = self._clipboard_event or {}
+        kind = info.get("kind", "text")
+        preview = info.get("preview") or ""
+        url = info.get("url")
+
+        left, top = rect.left(), rect.top()
+        w, h = rect.width(), rect.height()
+        pad = 10
+
+        # 左侧圆形衬底 + 图标（图片内容直接显示缩略图）
+        icon_d = h - 14
+        cx = left + pad + icon_d / 2
+        cy = top + h / 2
+        circle = QRectF(cx - icon_d / 2, cy - icon_d / 2, icon_d, icon_d)
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 30))
+        painter.drawEllipse(circle)
+        painter.setBrush(Qt.NoBrush)
+
+        pm = info.get("pixmap") if kind == "image" else None
+        if pm is not None and not pm.isNull():
+            # 缩略图按圆形裁切铺满（缓存缩放结果，避免每帧 SmoothTransformation）
+            side = icon_d - 4
+            cache_key = (id(pm), int(side))
+            if self._clip_scaled_pixmap_key != cache_key:
+                self._clip_scaled_pixmap = pm.scaled(
+                    int(side * 2), int(side * 2),
+                    Qt.KeepAspectRatioByExpanding,
+                    Qt.SmoothTransformation)
+                self._clip_scaled_pixmap_key = cache_key
+            scaled = self._clip_scaled_pixmap
+            painter.save()
+            clip = QPainterPath()
+            clip.addEllipse(circle.adjusted(2, 2, -2, -2))
+            painter.setClipPath(clip)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform)
+            painter.drawPixmap(QRectF(cx - side / 2, cy - side / 2,
+                                      side, side),
+                               scaled, QRectF(scaled.rect()))
+            painter.restore()
+        else:
+            side = icon_d * 0.5 * max(0.0, self._clip_icon_scale)
+            if side > 1:
+                pm_copy = self._get_icon_pixmap("复制", side)
+                if pm_copy is not None:
+                    painter.drawPixmap(QRectF(cx - side / 2, cy - side / 2,
+                                              side, side),
+                                       pm_copy, QRectF(pm_copy.rect()))
+
+        text_left = left + pad + icon_d + 10
+        text_right = left + w - pad
+
+        # 右侧动作区
+        if url:
+            pill_w, pill_h = 46.0, 22.0
+            pill = QRectF(text_right - pill_w, cy - pill_h / 2, pill_w, pill_h)
+            pill_path = QPainterPath()
+            pill_path.addRoundedRect(pill, pill_h / 2, pill_h / 2)
+            painter.fillPath(pill_path, QColor(255, 255, 255, 34))
+            painter.setFont(self._get_font(8.5, bold=True))
+            painter.setPen(QColor(255, 255, 255, 235 if not self._dimmed else 140))
+            painter.drawText(pill, Qt.AlignCenter, "打开")
+            # 点击热区（窗口绝对坐标，外扩 4px，与 _paint_control_buttons 一致）
+            p = 4
+            self._control_zones["open_link"] = QRect(
+                int(pill.left()) - p, int(pill.top()) - p,
+                int(pill.width()) + p * 2, int(pill.height()) + p * 2)
+            text_right = pill.left() - 8
+        elif self._state == "hover":
+            # 悬停提示：点击胶囊任意处查看历史
+            hint_w = 52.0
+            painter.setFont(self._get_font(8))
+            painter.setPen(QColor(255, 255, 255, 120 if not self._dimmed else 80))
+            painter.drawText(QRectF(text_right - hint_w, top, hint_w, h),
+                             Qt.AlignRight | Qt.AlignVCenter, "历史 ›")
+            text_right -= hint_w + 6
+
+        text_w = text_right - text_left
+
+        f = self._get_font(10, bold=(kind == "url"))
+        painter.setFont(f)
+        painter.setPen(QColor(255, 255, 255, 235 if not self._dimmed else 140))
+        metrics = QFontMetrics(f)
+        elide = Qt.ElideMiddle if kind == "url" else Qt.ElideRight
+        painter.drawText(QRectF(text_left, top, text_w, h),
+                         Qt.AlignLeft | Qt.AlignVCenter,
+                         metrics.elidedText(preview, elide, int(text_w)))
 
     # --- 下载内容绘制 ---
     @staticmethod
@@ -1117,6 +2582,166 @@ class DynamicIslandWidget(QWidget):
         if show_controls:
             self._paint_control_buttons(painter, rect, btn_w, btn_gap, playing)
 
+    # --- 视频内容绘制 ---
+    @staticmethod
+    def _fmt_media_time(ms):
+        """毫秒 → mm:ss（满 1 小时用 h:mm:ss）"""
+        ms = max(0, int(ms or 0))
+        total_s = ms // 1000
+        h, rem = divmod(total_s, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    def _paint_video_content(self, painter, rect):
+        """绘制视频信息：左侧缩略图 + 播放图标 + 标题 + 平台/UP主 + 进度条"""
+        left = rect.left()
+        top = rect.top()
+        w = rect.width()
+        h = rect.height()
+        pad = 10
+
+        info = self._music_info or {}
+        title = info.get("title", "")
+        artist = info.get("artist", "")        # 视频里通常是 UP主/频道名
+        platform = info.get("platform", "")     # 识别到的平台名，如 "哔哩哔哩"
+        playing = info.get("playing", False)
+        position_ms = info.get("position_ms") or 0
+        duration_ms = info.get("duration_ms") or 0
+
+        # 视频进度百分比（有 duration 时才绘制）
+        progress_frac = 0.0
+        if duration_ms > 0 and position_ms > 0:
+            progress_frac = max(0.0, min(float(position_ms) / float(duration_ms), 1.0))
+
+        # 缩略图区域（圆形封面 + 中央播放小三角）
+        thumb_size = int(h - 8)
+        thumb_x = left + pad
+        thumb_y = top + (h - thumb_size) / 2
+
+        # 先画缩略图（如果有封面）
+        if self._music_thumb and not self._music_thumb.isNull():
+            painter.drawPixmap(QRectF(thumb_x, thumb_y, thumb_size, thumb_size),
+                               self._music_thumb,
+                               QRectF(self._music_thumb.rect()))
+            # 视频缩略图上叠一层半透明深色 + 播放三角，增强视频感
+            painter.setPen(Qt.NoPen)
+            path = QPainterPath()
+            path.addEllipse(thumb_x, thumb_y, thumb_size, thumb_size)
+            painter.fillPath(path, QColor(0, 0, 0, 60))
+            painter.setBrush(Qt.NoBrush)
+
+            # 中央播放小三角（白底）
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(255, 255, 255, 220))
+            cx = thumb_x + thumb_size / 2
+            cy = thumb_y + thumb_size / 2
+            tri_size = thumb_size * 0.28
+            tri_path = QPainterPath()
+            tri_path.moveTo(cx - tri_size * 0.35, cy - tri_size * 0.6)
+            tri_path.lineTo(cx + tri_size * 0.75, cy)
+            tri_path.lineTo(cx - tri_size * 0.35, cy + tri_size * 0.6)
+            tri_path.closeSubpath()
+            painter.drawPath(tri_path)
+            painter.setBrush(Qt.NoBrush)
+        else:
+            # 无封面：圆形衬底 + ▶ 视频图标
+            path = QPainterPath()
+            path.addEllipse(thumb_x, thumb_y, thumb_size, thumb_size)
+            painter.fillPath(path, QColor(255, 255, 255, 30))
+            painter.setPen(QColor(255, 255, 255, 200))
+            f = painter.font()
+            f.setPointSize(int(thumb_size * 0.5))
+            painter.setFont(f)
+            painter.drawText(QRectF(thumb_x, thumb_y, thumb_size, thumb_size),
+                             Qt.AlignCenter, "▶")
+
+        # 文字区域
+        text_left = thumb_x + thumb_size + 10
+        text_width = w - (text_left - left) - pad
+
+        # 根据状态决定是否显示控制按钮
+        show_controls = (self._state == "hover")
+        btn_w = 32 if show_controls else 0
+        btn_gap = 6 if show_controls else 0
+        text_width -= (btn_w * 3 + btn_gap * 2 + 8) if show_controls else 0
+
+        # 标题
+        title_font = painter.font()
+        title_font.setPointSize(10)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.setPen(QColor(255, 255, 255, 230 if not self._dimmed else 130))
+        title_metrics = QFontMetrics(title_font)
+        elided_title = title_metrics.elidedText(title, Qt.ElideRight, int(text_width))
+
+        # 第二行文字：平台名 + UP主/频道
+        second_line_parts = []
+        if platform:
+            second_line_parts.append(f"· {platform}")
+        if artist:
+            second_line_parts.append(artist)
+        second_line = "  ".join(second_line_parts)
+
+        has_second = bool(second_line)
+
+        title_rect = QRectF(
+            text_left,
+            top + (h - 18) / 2 - (10 if has_second else -8),
+            text_width, 18
+        )
+        painter.drawText(title_rect, Qt.AlignLeft | Qt.AlignVCenter, elided_title)
+
+        # 第二行（平台 + UP主）
+        if has_second:
+            second_font = painter.font()
+            second_font.setPointSize(8)
+            second_font.setBold(False)
+            painter.setFont(second_font)
+            # 平台名用稍亮的蓝白色，UP主用次亮
+            painter.setPen(QColor(255, 255, 255, 150 if not self._dimmed else 90))
+            second_metrics = QFontMetrics(second_font)
+            elided_second = second_metrics.elidedText(second_line, Qt.ElideRight, int(text_width))
+            second_rect = QRectF(text_left, title_rect.bottom() - 2, text_width, 14)
+            painter.drawText(second_rect, Qt.AlignLeft | Qt.AlignVCenter, elided_second)
+
+        # 控制按钮（hover 时显示，与音乐共用）
+        if show_controls:
+            self._paint_control_buttons(painter, rect, btn_w, btn_gap, playing)
+
+        # 进度条：hover 且有 duration 时显示（在文字与按钮之间的区域底部）
+        if show_controls and progress_frac > 0:
+            bar_h = 3.0
+            bar_y = rect.bottom() - pad / 2 - bar_h
+            bar_left = text_left
+            bar_right = rect.right() - pad - (btn_w * 3 + btn_gap * 2 + 8)
+            bar_total_w = bar_right - bar_left
+            if bar_total_w > 40:
+                # 背景
+                painter.setPen(Qt.NoPen)
+                bar_path = QPainterPath()
+                bar_path.addRoundedRect(
+                    QRectF(bar_left, bar_y, bar_total_w, bar_h),
+                    bar_h / 2, bar_h / 2)
+                painter.fillPath(bar_path, QColor(255, 255, 255, 38))
+                # 已播放
+                fill_path = QPainterPath()
+                fill_path.addRoundedRect(
+                    QRectF(bar_left, bar_y, bar_total_w * progress_frac, bar_h),
+                    bar_h / 2, bar_h / 2)
+                painter.fillPath(fill_path, QColor(255, 255, 255, 220))
+                # 时间（右下角，很小）
+                time_font = painter.font()
+                time_font.setPointSize(7)
+                painter.setFont(time_font)
+                painter.setPen(QColor(255, 255, 255, 120 if not self._dimmed else 70))
+                time_text = f"{self._fmt_media_time(position_ms)} / {self._fmt_media_time(duration_ms)}"
+                time_metrics = QFontMetrics(time_font)
+                painter.drawText(
+                    QRectF(bar_left, bar_y - 12, bar_total_w, 12),
+                    Qt.AlignRight | Qt.AlignVCenter, time_text)
+
     def _paint_control_buttons(self, painter, rect, btn_w, gap, playing):
         """绘制播放控制按钮"""
         btn_h = 28
@@ -1252,7 +2877,15 @@ class DynamicIslandWidget(QWidget):
             pos = event.position().toPoint()
             for name, zone in self._control_zones.items():
                 if zone.contains(pos):
-                    self.media_control_clicked.emit(name)
+                    if name == "open_link":
+                        self.open_link_requested.emit(
+                            self._clipboard_open_url or "")
+                    elif name == "copy_code":
+                        self.code_copy_requested.emit()
+                    elif name == "open_transfer":
+                        self.transfer_open_requested.emit()
+                    else:
+                        self.media_control_clicked.emit(name)
                     event.accept()
                     return
             self.clicked.emit()
@@ -1261,6 +2894,16 @@ class DynamicIslandWidget(QWidget):
 
 class CapsuleWidget(QMainWindow):
     """胶囊悬浮窗主窗口（灵动岛风格）"""
+
+    def moveEvent(self, event):
+        """阻止窗口移动 - 强制回到锚点位置"""
+        # 如果锚点已设置，强制窗口回到锚点位置（含游戏模式右上角锚点
+        # 与锚点切换滑动偏移，统一走 _apply_anchor_position）
+        if hasattr(self, '_anchor_x') and self._anchor_x is not None:
+            # 使用 QTimer 延迟设置位置，避免递归调用
+            QTimer.singleShot(
+                0, lambda: self._apply_anchor_position(self.island.size()))
+        event.ignore()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1279,18 +2922,32 @@ class CapsuleWidget(QMainWindow):
         # 窗口状态
         self._is_dimmed = False
         self._idle_timer = None
-        self._side_panel = None
+        # 硬件高负载告警真实状态（游戏形态期间只记录不展示，退出游戏后可恢复）
+        self._hw_alert_active = False
+        self._hw_alert_stats = None
+        self._native_main_window = None
         self._tray_icon = None
         self._smtc_monitor = None
-        self._download_monitor = None
         self._bt_monitor = None
-        self._settings_window = None
+        self._clipboard_monitor = None
+        self._clipboard_panel = None
         self._hw_monitor = None
+        self._calendar_monitor = None
+        self._todo_backend = None
         self._settings_backend = None
 
-        # 拖动相关
-        self.drag_position = None
-        self._press_pos = None
+        # 窗口锚点（_setup_window_geometry 中确定，之后固定不变）
+        self._anchor_mode = "center_top"
+        self._anchor_x = None
+        self._anchor_y = None
+        # 游戏模式：游戏运行时岛钉到屏幕右上角显示瘦小帧率形态
+        self._game_mode = False
+        # 检测到游戏但首帧数据尚未到达时的等待信息 / 兜底切换定时器
+        self._game_pending_info = None
+        self._game_switch_timer = None
+        # 锚点切换滑动偏移（动画期间叠加在锚点定位上，无动画时为 0）
+        self._pos_offset = QPointF(0, 0)
+        self._pos_anim = None
 
         # 初始化UI
         self._init_ui()
@@ -1298,17 +2955,21 @@ class CapsuleWidget(QMainWindow):
         self._init_settings()
         self._init_idle_timer()
         self._init_smtc()
-        self._init_download()
         self._init_bluetooth()
+        self._init_clipboard()
         self._init_hardware()
+        self._init_calendar()
+        self._init_todo_reminder()
 
         # 设置窗口位置
         self._setup_window_geometry()
+        # 屏幕可用区域变化（分辨率/任务栏调整）时重算锚点，保持固定位置
+        QApplication.primaryScreen().availableGeometryChanged.connect(
+            self._setup_window_geometry)
 
-        # 启用亚克力（需要在窗口句柄创建后）
-        # 注意：亚克力效果会让透明背景显示桌面内容，产生白色矩形
-        # 如需纯净黑色胶囊，请注释掉下面这行
-        # QTimer.singleShot(0, lambda: enable_acrylic(self))
+        # 使用 Windows API 锁定窗口位置
+        if sys.platform == "win32":
+            self._lock_window_position()
 
     def _init_ui(self):
         """初始化UI"""
@@ -1317,6 +2978,7 @@ class CapsuleWidget(QMainWindow):
         self.island.clicked.connect(self._on_capsule_clicked)
         self.island.sizeChanged.connect(self._on_island_size_changed)
         self.island.media_control_clicked.connect(self._on_media_control)
+        self.island.open_link_requested.connect(self._on_clipboard_open_link)
 
     def _init_smtc(self):
         """初始化 SMTC 音乐监控"""
@@ -1336,30 +2998,11 @@ class CapsuleWidget(QMainWindow):
         if self._smtc_monitor:
             self._smtc_monitor.handle_command(command)
 
-    def _init_download(self):
-        """初始化全局下载进度监控（浏览器/下载器未完成文件 + History 总大小）"""
-        try:
-            from capsule_app.download_monitor_backend import DownloadMonitorBackend
-            self._download_monitor = DownloadMonitorBackend()
-            self._download_monitor.download_updated.connect(self._on_download_info)
-        except Exception as e:
-            print(f"[Capsule] 下载监控初始化失败: {e}")
-
-    def _on_download_info(self, info):
-        """收到下载进度更新"""
-        if not self._notify_enabled("notify_download"):
-            return
-        self.island.set_download_info(info)
-
     def _init_bluetooth(self):
         """初始化蓝牙耳机连接/断开实时监控"""
-        try:
-            from capsule_app.bluetooth_backend import BluetoothConnectionMonitor
-            self._bt_monitor = BluetoothConnectionMonitor()
-            self._bt_monitor.connection_changed.connect(
-                self._on_bluetooth_connection)
-        except Exception as e:
-            print(f"[Capsule] 蓝牙连接监控初始化失败: {e}")
+        # 临时禁用：Python 3.14 下蓝牙 COM 监控线程触发 access violation 杀死进程
+        print("[Capsule] 蓝牙连接监控已临时禁用（Python 3.14 兼容性问题）")
+        return
 
     def _on_bluetooth_connection(self, info):
         """耳机连接/断开：弹出灵动岛通知，并取消可能的闲置减淡"""
@@ -1367,6 +3010,35 @@ class CapsuleWidget(QMainWindow):
         if not self._notify_enabled("notify_bluetooth"):
             return
         self.island.set_bluetooth_event(info)
+
+    def _init_clipboard(self):
+        """初始化剪贴板监控（WM_CLIPBOARDUPDATE 挂在本窗口句柄上）"""
+        try:
+            from capsule_app.clipboard_backend import ClipboardMonitor
+            self._clipboard_monitor = ClipboardMonitor()
+            self._clipboard_monitor.captured.connect(self._on_clipboard_captured)
+            self._clipboard_monitor.attach(int(self.winId()))
+        except Exception as e:
+            print(f"[Capsule] 剪贴板监控初始化失败: {e}")
+
+    def _on_clipboard_captured(self, info):
+        """复制内容：小岛轻弹通知，并取消可能的闲置减淡"""
+        self._reset_idle_timer()
+        if not self._notify_enabled("notify_clipboard"):
+            return
+        self.island.set_clipboard_event(info)
+
+    def _on_clipboard_open_link(self, url):
+        """剪贴板通知上的"打开"按钮：识别链接一键打开"""
+        if url:
+            try:
+                from capsule_app.clipboard_backend import normalize_url
+                normalized = normalize_url(url)
+                if normalized:
+                    QDesktopServices.openUrl(QUrl(normalized))
+            except Exception as e:
+                print(f"[Capsule] 打开链接失败: {e}")
+        self.island.dismiss_clipboard_event()
 
     def _init_hardware(self):
         """初始化硬件监控（CPU/内存/GPU/网速/温度，高负载弹出告警）"""
@@ -1379,58 +3051,302 @@ class CapsuleWidget(QMainWindow):
             print(f"[Capsule] 硬件监控初始化失败: {e}")
 
     def _on_hw_alert(self, active, stats):
-        """高负载开始/结束：弹出或收回硬件告警形态，并取消可能的闲置减淡"""
+        """高负载开始/结束：弹出或收回硬件告警形态，并取消可能的闲置减淡
+
+        游戏启动/运行期间静默降级：只记录日志、不向界面弹报警，避免启动
+        游戏时被高负载告警打断；退出游戏后若仍处于高负载会恢复展示。
+        """
         self._reset_idle_timer()
+        self._hw_alert_active = bool(active)
+        self._hw_alert_stats = stats if active else None
+        if self._game_notification_muted():
+            if active:
+                print("[Capsule] 游戏形态期间硬件高负载告警已静默（仅记录日志）")
+            return
         if not self._notify_enabled("notify_hardware"):
             return
         self.island.set_hw_alert(active, stats)
 
     def _on_hw_stats(self, stats):
-        """采样更新：仅在告警展示期间刷新负载条"""
+        """采样更新：告警展示期间刷新负载条；游戏形态复用同一份采样显示温度/内存"""
         if self.island.is_hw_alerting():
             self.island.set_hardware_stats(stats)
+        self.island.set_system_stats(stats)
+        dlog("Island", f"hw payload gpu_temp={stats.get('gpu_temp')} "
+                       f"mem={stats.get('mem')} cpu_temp={stats.get('cpu_temp')}")
 
-    def _open_settings_window(self):
-        """从侧边栏"高级设置"按钮打开独立设置窗口"""
-        if self._settings_window is None:
-            from capsule_app.settings_window import SettingsWindow
-            self._settings_window = SettingsWindow(
-                settings_backend=self._settings_backend)
-        # 确保 web_view 已注册（关闭时会注销，重开需重新注册）
-        self._settings_backend.set_web_view(self._settings_window.web_view)
-        self._settings_window.show()
-        self._settings_window.raise_()
-        self._settings_window.activateWindow()
+    def _game_notification_muted(self):
+        """游戏启动/运行期间是否静默提醒（不向界面弹任何报警提示）"""
+        return self._game_mode or self._game_pending_info is not None
 
-    def _on_island_size_changed(self, w, h):
-        """胶囊尺寸变化时，同步窗口大小并保持中心对齐"""
-        # 记录当前中心点
-        current_center = self.geometry().center()
-        # 直接设置窗口大小为 island 的外圈尺寸
-        self.setFixedSize(self.island.size())
-        # 恢复中心点（仅在拖动未激活时）
-        if self.drag_position is None:
-            new_geo = self.geometry()
-            new_geo.moveCenter(current_center)
-            self.setGeometry(new_geo)
+    def _init_calendar(self):
+        """初始化日历监控（Outlook COM 读下一条日程，临近时弹提醒）
 
-    def _setup_window_geometry(self):
-        """设置窗口位置 - 顶部居中"""
+        未装 / 未运行 Outlook：后端静默不弹任何通知，不影响其他形态。
+        """
+        try:
+            from capsule_app.calendar_backend import CalendarMonitor
+            self._calendar_monitor = CalendarMonitor()
+            self._calendar_monitor.approaching.connect(
+                self._on_calendar_approaching)
+        except Exception as e:
+            print(f"[Capsule] 日历监控初始化失败: {e}")
+
+    def _on_calendar_approaching(self, info):
+        """下一条日程临近：弹出灵动岛通知，并取消可能的闲置减淡"""
+        self._reset_idle_timer()
+        self.island.set_calendar_event(info)
+
+    def _on_calendar_open(self, entry_id):
+        """日历通知被点击：在 Outlook 中打开该约会（EntryID 为空则打开日历视图）"""
+        if self._calendar_monitor is not None:
+            self._calendar_monitor.open_in_outlook(entry_id or "")
+        self.island.dismiss_calendar_event()
+
+    # --- 待办到点提醒 ---
+    def _init_todo_reminder(self):
+        """启动待办提醒调度器：读取持久化的待办，到点弹灵动岛通知
+
+        调度器是进程内单例：主界面保存待办后推给它，主界面没打开也能提醒。
+        """
+        try:
+            from capsule_app.todo_backend import TodoReminderBackend
+            self._todo_backend = TodoReminderBackend.instance()
+            self._todo_backend.reminder_due.connect(self._on_todo_reminder)
+        except Exception as e:
+            print(f"[CapsuleWindow] 初始化待办提醒失败: {e}")
+
+    def _on_todo_reminder(self, info):
+        """待办到点：弹出灵动岛提醒，并取消可能的闲置减淡"""
+        if not self._notify_enabled("notify_todo"):
+            return
+        self._reset_idle_timer()
+        self.island.set_todo_event(info)
+
+    def _on_todo_remind_open(self):
+        """待办提醒被点击：打开控制台并切到待办页"""
+        self.island.dismiss_todo_event()
+        self._open_native_main_window()
+        if self._native_main_window is not None:
+            self._native_main_window.select_page("nav.todo")
+
+    def _open_clipboard_panel(self):
+        """打开剪贴板历史面板（胶囊下方弹出）"""
+        if self._clipboard_panel is None:
+            from capsule_app.clipboard_panel_window import ClipboardPanelWidget
+            self._clipboard_panel = ClipboardPanelWidget(self._clipboard_monitor)
+
+        panel = self._clipboard_panel
+        panel.prepare_show()
+
         screen = QApplication.primaryScreen()
         screen_geometry = screen.availableGeometry()
 
+        capsule_geo = self.geometry()
+        x = capsule_geo.center().x() - panel.width() // 2
+        x = max(screen_geometry.x() + 10,
+                min(x, screen_geometry.right() - panel.width() - 10))
+        y = capsule_geo.bottom() + 12
+        if y + panel.height() > screen_geometry.bottom() - 10:
+            y = max(screen_geometry.y() + 10,
+                    capsule_geo.top() - panel.height() - 12)
+
+        panel.show_at(QPoint(x, y))
+
+    # ------------------------------------------------------------------
+    # 剪贴板历史管理
+    # ------------------------------------------------------------------
+    def _clear_clipboard_history(self):
+        """主界面/设置窗口"清空剪贴板历史"按钮：清空本地剪贴板历史"""
+        if self._clipboard_monitor is not None:
+            self._clipboard_monitor.clear_history()
+            print("[Capsule] 已清空剪贴板历史")
+
+    def _open_native_main_window(self):
+        """打开 Windows 原生主界面（Nav 列表 + StackedWidget 多页）"""
+        try:
+            # 剪贴板面板打开时先收起
+            if self._clipboard_panel is not None and self._clipboard_panel.isVisible():
+                self._clipboard_panel.hide()
+
+            if self._native_main_window is None:
+                from capsule_app.native_main_window import NativeMainWindow
+                self._native_main_window = NativeMainWindow(
+                    smtc=self._smtc_monitor,
+                    settings=self._settings_backend)
+                self._native_main_window.open_clipboard_requested.connect(
+                    self._open_clipboard_panel)
+                self._native_main_window.clear_clipboard_requested.connect(
+                    self._clear_clipboard_history)
+                self._native_main_window.open_settings_requested.connect(
+                    self._open_native_settings_window)
+
+            w = self._native_main_window
+            if w.isMinimized():
+                w.showNormal()
+            w.show()
+            w.raise_()
+            w.activateWindow()
+        except Exception as e:
+            import traceback
+            print(f"[Capsule] 打开原生主界面失败: {e}")
+            traceback.print_exc()
+
+    def _open_native_settings_window(self):
+        """托盘"控制台"入口：打开统一主窗口并定位到日志页。
+
+        日志/蓝牙/设置等页面都已并入 NativeMainWindow，
+        不再使用独立窗口。
+        """
+        self._open_native_main_window()
+        try:
+            if self._native_main_window is not None:
+                self._native_main_window.select_page("nav.log")
+        except Exception:
+            pass
+
+    def _on_island_size_changed(self, w, h):
+        """胶囊尺寸变化时，按固定锚点重新定位窗口
+
+        位置只由锚点与新尺寸决定，不读取 self.geometry() 的历史值——
+        在高频 setGeometry 期间该缓存可能与真实窗口位置脱节，曾导致
+        每次悬停展开/收起循环窗口向右下漂移（增量尺寸的一半）。
+        """
+        if self._anchor_x is None:
+            self._setup_window_geometry()
+            return
+        self._apply_anchor_position(self.island.size())
+
+    def set_game_mode(self, active):
+        """切换游戏模式：岛滑动到屏幕右上角（瘦小帧率形态）或回到配置锚点
+
+        锚点切换伴随一次平滑滑动：先按新锚点定位，再把旧位置作为偏移量
+        动画归零，避免窗口横跨屏幕瞬移；滑动期间尺寸动画仍正常叠加。
+        """
+        active = bool(active)
+        if active == self._game_mode:
+            return
+        print(f"[Capsule] 游戏模式: {'开启(右上角)' if active else '关闭(回锚点)'}")
+        old_pos = self.geometry().topLeft()
+        self._game_mode = active
+        self._pos_offset = QPointF(0, 0)
+        if self._anchor_x is None:
+            return  # 尚未完成首次定位，由初始化流程按新模式处理
+        self._setup_window_geometry()
+        dx = old_pos.x() - self.x()
+        dy = old_pos.y() - self.y()
+        if dx == 0 and dy == 0:
+            return
+        # 从旧位置滑动到新锚点：先把偏移补回去消除瞬移，再动画归零
+        self._pos_offset = QPointF(dx, dy)
+        self._apply_anchor_position(self.island.size())
+        if self._pos_anim is None:
+            self._pos_anim = QVariantAnimation(self)
+            self._pos_anim.setEasingCurve(QEasingCurve.OutCubic)
+            self._pos_anim.valueChanged.connect(self._on_pos_anim)
+        self._pos_anim.stop()
+        duration = self._config.get("animation", {}).get("collapse_ms", 240)
+        self._pos_anim.setDuration(duration)
+        self._pos_anim.setStartValue(QPointF(dx, dy))
+        self._pos_anim.setEndValue(QPointF(0, 0))
+        self._pos_anim.start()
+
+    def _on_pos_anim(self, offset):
+        """锚点滑动帧：更新位置偏移并按当前尺寸重新定位"""
+        self._pos_offset = offset
+        self._apply_anchor_position(self.island.size())
+
+    def _setup_window_geometry(self):
+        """确定锚点并按当前尺寸定位窗口
+
+        锚点在窗口生命周期内固定（仅随屏幕可用区域变化而重算），
+        之后所有尺寸变化都按锚点定位，与历史 geometry 无关，
+        窗口位置是确定性的，即使被外部因素扰动也会在下次尺寸
+        变化时自动回正。
+        """
+        screen = QApplication.primaryScreen()
+        sg = screen.availableGeometry()
+
         anchor = self._config.get("anchor", "top_center")
-        w = self.island.width()
-        h = self.island.height()
-
-        if anchor == "top_center":
-            x = screen_geometry.x() + (screen_geometry.width() - w) // 2
-            y = screen_geometry.y() + 10
+        if self._game_mode:
+            # 游戏模式：锚点语义为窗口右缘 x + 窗口顶部 y，钉在屏幕右上角
+            self._anchor_mode = "right_top"
+            self._anchor_x = sg.x() + sg.width() - 10
+            self._anchor_y = sg.y() + 10
+        elif anchor == "top_center":
+            # 锚点语义：窗口中心 x + 窗口顶部 y
+            self._anchor_mode = "center_top"
+            self._anchor_x = sg.x() + sg.width() // 2
+            self._anchor_y = sg.y() + 10
         else:
-            x = screen_geometry.x() + 10
-            y = screen_geometry.y() + (screen_geometry.height() - h) // 2
+            # 锚点语义：窗口左缘 x + 窗口中心 y
+            self._anchor_mode = "left_center"
+            self._anchor_x = sg.x() + 10
+            self._anchor_y = sg.y() + sg.height() // 2
 
-        self.setGeometry(x, y, w, h)
+        self._apply_anchor_position(self.island.size())
+
+    def _apply_anchor_position(self, size):
+        """按已保存的锚点 + 给定尺寸定位窗口（单次 setGeometry）"""
+        if self._anchor_mode == "center_top":
+            x = self._anchor_x - size.width() // 2
+            y = self._anchor_y
+        elif self._anchor_mode == "right_top":
+            x = self._anchor_x - size.width()
+            y = self._anchor_y
+        else:
+            x = self._anchor_x
+            y = self._anchor_y - size.height() // 2
+        # 叠加锚点切换滑动偏移（无动画时为 0）
+        x += int(round(self._pos_offset.x()))
+        y += int(round(self._pos_offset.y()))
+        self.setGeometry(x, y, size.width(), size.height())
+
+    def _lock_window_position(self):
+        """使用 Windows API 锁定窗口位置，防止被移动"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            # 获取窗口句柄
+            hwnd = int(self.winId())
+
+            # 获取当前窗口位置
+            rect = wintypes.RECT()
+            ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+
+            # 使用 SetWindowPos 锁定窗口位置
+            # SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010
+            SWP_NOSIZE = 0x0001
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
+
+            # 设置窗口位置并锁定
+            ctypes.windll.user32.SetWindowPos(
+                hwnd,
+                0,  # hWndInsertAfter
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+            )
+
+            # 移除窗口的可移动样式
+            GWL_STYLE = -16
+            WS_CAPTION = 0x00C00000
+            WS_THICKFRAME = 0x00040000
+
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+            # 移除标题栏和可调整大小的边框
+            style &= ~WS_CAPTION
+            style &= ~WS_THICKFRAME
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+
+            print(f"[CapsuleWindow] 窗口位置已锁定：{rect.left}, {rect.top}")
+        except Exception as e:
+            print(f"[CapsuleWindow] 锁定窗口位置失败：{e}")
 
     def _init_system_tray(self):
         """初始化系统托盘图标与菜单。"""
@@ -1447,56 +3363,99 @@ class CapsuleWidget(QMainWindow):
         self._tray_icon.setToolTip("LsletUI")
 
         tray_menu = QMenu(self)
-        show_action = QAction("显示主界面", self)
-        show_action.triggered.connect(self._show_from_tray)
+        self._tray_menu = tray_menu
+        self._tray_show_main = QAction("打开主界面", self)
+        self._tray_show_main.triggered.connect(self._open_native_main_window)
 
-        hide_action = QAction("隐藏主界面", self)
-        hide_action.triggered.connect(self._hide_to_tray)
+        self._tray_hide_main = QAction("隐藏主界面", self)
+        self._tray_hide_main.triggered.connect(self._hide_main_window)
 
-        exit_action = QAction("退出", self)
-        exit_action.triggered.connect(self._exit_application)
+        self._tray_settings = QAction("设置", self)
+        self._tray_settings.triggered.connect(self._open_native_settings_window)
 
-        tray_menu.addAction(show_action)
-        tray_menu.addAction(hide_action)
+        self._tray_show_island = QAction("显示灵动岛", self)
+        self._tray_show_island.triggered.connect(self._show_from_tray)
+
+        self._tray_hide_island = QAction("隐藏灵动岛", self)
+        self._tray_hide_island.triggered.connect(self._hide_island_only)
+
+        self._tray_exit = QAction("退出", self)
+        self._tray_exit.triggered.connect(self._exit_application)
+
+        tray_menu.addAction(self._tray_show_main)
+        tray_menu.addAction(self._tray_hide_main)
+        tray_menu.addAction(self._tray_settings)
         tray_menu.addSeparator()
-        tray_menu.addAction(exit_action)
+        tray_menu.addAction(self._tray_show_island)
+        tray_menu.addAction(self._tray_hide_island)
+        tray_menu.addSeparator()
+        tray_menu.addAction(self._tray_exit)
 
         self._tray_icon.setContextMenu(tray_menu)
         self._tray_icon.activated.connect(self._on_tray_activated)
         self._tray_icon.show()
+        self._refresh_tray_labels()
 
     def _on_tray_activated(self, reason):
         if reason not in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
             return
-        self._show_from_tray()
+        self._open_native_main_window()
 
     def _show_from_tray(self):
         self.show()
         self.raise_()
         self.activateWindow()
 
-    def _hide_to_tray(self):
-        if self._side_panel is not None and self._side_panel.isVisible():
-            self._side_panel.hide()
+    def _hide_island_only(self):
         self.hide()
+
+    def _hide_main_window(self):
+        if self._native_main_window is not None and self._native_main_window.isVisible():
+            self._native_main_window.hide()
+
+    def _hide_to_tray(self):
+        self._hide_main_window()
+        self.hide()
+
+    def _refresh_tray_labels(self):
+        lang = "zh"
+        if self._settings_backend is not None:
+            lang = self._settings_backend.get_settings().get("language", "zh")
+        from capsule_app.native_ui import tr
+        if not hasattr(self, "_tray_show_main"):
+            return
+        self._tray_show_main.setText(tr(lang, "tray.showMain"))
+        self._tray_hide_main.setText(tr(lang, "tray.hideMain"))
+        self._tray_settings.setText(tr(lang, "tray.settings"))
+        self._tray_show_island.setText(tr(lang, "tray.showIsland"))
+        self._tray_hide_island.setText(tr(lang, "tray.hideIsland"))
+        self._tray_exit.setText(tr(lang, "tray.exit"))
 
     def _exit_application(self):
         # 停止所有后台监控线程
+        if self._clipboard_monitor is not None:
+            self._clipboard_monitor.detach()
         if self._smtc_monitor is not None:
             self._smtc_monitor.stop()
-        if self._download_monitor is not None:
-            self._download_monitor.stop()
         if self._bt_monitor is not None:
             self._bt_monitor.stop()
         if self._hw_monitor is not None:
             self._hw_monitor.stop()
+        if self._calendar_monitor is not None:
+            self._calendar_monitor.stop()
         # 注意：不在此处调用 gc.collect()。各 COM 线程的 stop() 已在
         # 各自套间内 gc.collect() 并 join，主线程做 gc 反而可能跨套间
         # Release 残留 COM 指针 → 0xC0000005 闪退。
-        if self._side_panel is not None:
-            self._side_panel.close()
-        if self._settings_window is not None:
-            self._settings_window.close()
+        if self._native_main_window is not None:
+            try:
+                if hasattr(self._native_main_window, "shutdown"):
+                    self._native_main_window.shutdown()
+                else:
+                    self._native_main_window.close()
+            except Exception:
+                pass
+        if self._clipboard_panel is not None:
+            self._clipboard_panel.close()
         if self._tray_icon is not None:
             self._tray_icon.hide()
         app = QApplication.instance()
@@ -1514,6 +3473,9 @@ class CapsuleWidget(QMainWindow):
             from capsule_app.settings_backend import SettingsBackend
             self._settings_backend = SettingsBackend()
             self._settings_backend.settings_changed.connect(self._apply_settings)
+            self._refresh_tray_labels()
+            # 启动时应用一次当前设置（让液态玻璃/自动减淡等按已保存偏好立即生效）
+            self._apply_settings(self._settings_backend.get_settings())
         except Exception as e:
             print(f"[Capsule] 设置后端初始化失败: {e}")
 
@@ -1530,12 +3492,15 @@ class CapsuleWidget(QMainWindow):
                 self._is_dimmed = False
 
         # 灵动岛提醒开关关闭时立即收回对应胶囊
-        if not settings.get("notify_download", True):
-            self.island.set_download_info({"active": False, "state": "idle"})
         if not settings.get("notify_bluetooth", True):
             self.island.dismiss_bluetooth_event()
+        if not settings.get("notify_clipboard", True):
+            self.island.dismiss_clipboard_event()
         if not settings.get("notify_hardware", True):
             self.island.set_hw_alert(False, None)
+        if not settings.get("notify_todo", True):
+            self.island.dismiss_todo_event()
+        self._refresh_tray_labels()
 
     def _notify_enabled(self, key):
         """查询某类灵动岛提醒是否开启（设置后端未就绪时默认开启）"""
@@ -1577,7 +3542,10 @@ class CapsuleWidget(QMainWindow):
             self._is_dimmed = True
 
     def _on_capsule_clicked(self):
-        """胶囊点击事件处理"""
+        """胶囊点击事件处理（通知形态下打开对应功能，普通点击不弹出窗口）
+
+        普通点击只保持悬停展开效果；主界面仍可从托盘「控制台」进入。
+        """
         print("[CapsuleWindow] 点击事件开始")
         try:
             self._reset_idle_timer()
@@ -1591,75 +3559,46 @@ class CapsuleWidget(QMainWindow):
                 return
             self._last_toggle_ts = now
 
-            # 如果侧边面板已打开，则关闭
-            if self._side_panel is not None and self._side_panel.isVisible():
-                print("[CapsuleWindow] 关闭已打开的侧边面板")
-                self._side_panel.hide()
+            # 如果原生主界面已打开，则关闭
+            if self._native_main_window is not None and self._native_main_window.isVisible():
+                print("[CapsuleWindow] 关闭已打开的原生主界面")
+                self._native_main_window.hide()
                 return
 
-            # 打开侧边面板（传入共享的 SMTC/设置实例，避免重复轮询）
-            print("[CapsuleWindow] 准备打开侧边面板")
-            self._open_side_panel()
-            print("[CapsuleWindow] 侧边面板打开完成")
+            # 剪贴板历史面板打开时：点击胶囊收起
+            if self._clipboard_panel is not None and self._clipboard_panel.isVisible():
+                print("[CapsuleWindow] 关闭剪贴板历史面板")
+                self._clipboard_panel.hide()
+                return
+
+            # 剪贴板通知展示期间点胶囊：打开剪贴板历史
+            if self.island.is_clipboard_notifying():
+                print("[CapsuleWindow] 打开剪贴板历史（通知期间）")
+                self._open_clipboard_panel()
+                return
+
+            # 日历通知展示期间点胶囊：在 Outlook 中打开该约会
+            if self.island.is_calendar_notifying():
+                print("[CapsuleWindow] 打开日历")
+                self._on_calendar_open(self.island._calendar_open_id or "")
+                return
+
+            # 待办提醒展示期间点胶囊：打开控制台待办页
+            if self.island.is_todo_notifying():
+                print("[CapsuleWindow] 打开待办页（提醒期间）")
+                self._on_todo_remind_open()
+                return
+
+            # 普通点击不再弹出原生主界面：保持悬停展开即可，
+            # 主界面从托盘「控制台」入口打开。
         except Exception as e:
             import traceback
             print(f"[CapsuleWindow] 点击事件处理失败: {e}")
             traceback.print_exc()
 
-    def _open_side_panel(self):
-        """打开侧边面板（从胶囊生长出来）"""
-        print("[SidePanel] 开始创建侧边面板")
-        try:
-            if self._side_panel is None:
-                print("[SidePanel] 首次创建 SidePanelWidget")
-                from capsule_app.side_panel_window import SidePanelWidget
-                self._side_panel = SidePanelWidget(
-                    smtc=self._smtc_monitor,
-                    settings=self._settings_backend)
-                print("[SidePanel] SidePanelWidget 创建成功")
-                # 前端"高级设置"按钮 → 打开独立设置窗口
-                self._side_panel.open_settings_requested.connect(
-                    self._open_settings_window)
-
-            screen = QApplication.primaryScreen()
-            screen_geometry = screen.availableGeometry()
-
-            panel_width = int(screen_geometry.width() * 0.25)
-            panel_height = int(screen_geometry.height() * 0.9)
-
-            capsule_geo = self.geometry()
-            capsule_center_x = capsule_geo.center().x()
-
-            # 面板居中于胶囊，但限制在屏幕内
-            x = capsule_center_x - panel_width // 2
-            x = max(screen_geometry.x() + 10,
-                    min(x, screen_geometry.right() - panel_width - 10))
-            y = capsule_geo.bottom() + 12
-
-            # 如果下方空间不足，则放在胶囊上方
-            if y + panel_height > screen_geometry.bottom() - 10:
-                y = max(screen_geometry.y() + 10,
-                        capsule_geo.top() - panel_height - 12)
-
-            print(f"[SidePanel] 设置面板位置: {x},{y} {panel_width}x{panel_height}")
-            self._side_panel.setGeometry(x, y, panel_width, panel_height)
-            print("[SidePanel] 开始显示动画")
-            self._side_panel.show_with_animation(capsule_geo.center())
-            self._side_panel.raise_()
-            print("[SidePanel] 侧边面板显示完成")
-        except Exception as e:
-            import traceback
-            print(f"[SidePanel] 打开侧边面板失败: {e}")
-            traceback.print_exc()
-            self._side_panel = None
-
     def mousePressEvent(self, event):
         self._reset_idle_timer()
-        if event.button() == Qt.LeftButton:
-            global_pos = event.globalPosition().toPoint()
-            self.drag_position = global_pos - self.frameGeometry().topLeft()
-            self._press_pos = global_pos
-            event.accept()
+        event.accept()
 
     if sys.platform == "win32":
         def nativeEvent(self, eventType, message):
@@ -1674,38 +3613,28 @@ class CapsuleWidget(QMainWindow):
                     msg = wintypes.MSG.from_address(int(message))
                     WM_MOUSEACTIVATE = 0x0021
                     MA_ACTIVATE = 1
+                    WM_CLIPBOARDUPDATE = 0x031D
                     if msg.message == WM_MOUSEACTIVATE:
                         return True, MA_ACTIVATE
+                    if msg.message == WM_CLIPBOARDUPDATE:
+                        # 剪贴板变化：转发给监控后端（GUI 线程）
+                        if self._clipboard_monitor is not None:
+                            self._clipboard_monitor.on_clipboard_update()
+                        return True, 0
                 except Exception:
                     pass
             return super().nativeEvent(eventType, message)
 
     def mouseMoveEvent(self, event):
         self._reset_idle_timer()
-        if event.buttons() == Qt.LeftButton and self.drag_position is not None:
-            global_pos = event.globalPosition().toPoint()
-            new_pos = global_pos - self.drag_position
-            self.move(new_pos)
-            event.accept()
+        event.accept()
 
     def mouseReleaseEvent(self, event):
         self._reset_idle_timer()
-        if event.button() != Qt.LeftButton:
-            return
-
-        global_pos = event.globalPosition().toPoint()
-        is_click = False
-        if self._press_pos is not None:
-            dx = global_pos.x() - self._press_pos.x()
-            dy = global_pos.y() - self._press_pos.y()
-            if abs(dx) < 5 and abs(dy) < 5:
-                is_click = True
-
-        self.drag_position = None
-        self._press_pos = None
-
-        if is_click:
-            self._on_capsule_clicked()
+        # 注意：点击处理由 DynamicIslandWidget.mouseReleaseEvent 中的
+        # clicked 信号驱动，这里不再直接调用 _on_capsule_clicked()，
+        # 避免一次点击触发两次（信号 + 直接调用）。
+        event.accept()
 
     def _load_app_icon(self):
         """加载应用图标"""

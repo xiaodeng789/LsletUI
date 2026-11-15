@@ -1,18 +1,18 @@
 [project]
 name = "pyisland-lite"
-version = "0.1.0"
+version = "0.1.1"
 description = "轻量级灵动岛应用 - 低内存占用，长时间运行"
 readme = "README.md"
-license = {text = "PolyForm-Noncommercial-1.0.0"}
+license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [
-    {name = "LsletUI Authors"}
+    {name = "PyIsland Team", email = "team@pyisland.com"}
 ]
 keywords = ["desktop", "widget", "island", "lightweight"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: End Users/Desktop",
-    "License :: Other/Proprietary License",
+    "License :: OSI Approved :: MIT License",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -31,6 +31,7 @@ dependencies = [
     "win10toast>=0.9",
     "psutil>=5.9.0",
     "pywin32>=306",
+    "nvidia-ml-py>=12.0",
 ]
 
 [project.optional-dependencies]
@@ -40,6 +41,11 @@ dev = [
     "pylint>=3.0.0",
     "black>=23.0.0",
 ]
+
+[project.urls]
+Homepage = "https://pyisland.com"
+Repository = "https://github.com/pyisland/pyisland-lite"
+Documentation = "https://docs.pyisland.com"
 
 [project.scripts]
 pyisland-lite = "main:main"

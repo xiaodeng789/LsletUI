@@ -14,7 +14,8 @@ current_dir = Path(__file__).parent
 sys.path.insert(0, str(current_dir))
 
 # 关闭 Python 自动循环垃圾回收（关键稳定性措施）：
-# 本应用多个后台线程使用 COM（winrt 通知、pywin32 蓝牙 STA）。COM 接口指针必须在创建它的套间线程内 Release，
+# 本应用多个后台线程使用 COM（pycaw/comtypes 通话监控 MTA、winrt 通知、
+# pywin32 蓝牙/日历 STA）。COM 接口指针必须在创建它的套间线程内 Release，
 # 而自动 GC 可能在任意线程（如下载监控线程 json 解析触发分配）回收这些
 # 指针，跨套间调用 vtable 会直接 0xC0000005 访问违例杀死进程。
 # 各 COM 线程在自己的循环内/退出前显式 gc.collect()，在所属套间内回收。

@@ -19,6 +19,8 @@ class BluetoothBackend(QObject):
     devices_updated = Signal(list)
     # 蓝牙开关状态信号：True=开启, False=关闭
     bt_status_changed = Signal(bool)
+    # 扫描倒计时（秒）
+    countdown_updated = Signal(int)
 
     SCAN_INTERVAL_S = 60  # 扫描间隔（秒）
 
@@ -273,6 +275,7 @@ class BluetoothBackend(QObject):
 
     def _push_countdown(self):
         """将倒计时秒数推送给前端"""
+        self.countdown_updated.emit(self._countdown_remaining)
         if self.web_view and self.web_view.page():
             try:
                 js_code = f"window.handleBluetoothCountdown && window.handleBluetoothCountdown({self._countdown_remaining});"

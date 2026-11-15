@@ -4,11 +4,13 @@ LsletUI - 设置后端
 负责用户偏好的持久化（settings.json）与应用：
 - autostart：开机自启动（写入 HKCU 注册表 Run 键）
 - auto_dim / auto_dim_delay：胶囊无操作自动减淡及延迟
-- language：界面语言（zh/en），前端侧边栏据此切换中英文
+- language：界面语言（zh/zh-TW/en/ja/ko/de/ru/vi），前端侧边栏据此切换界面语言
 """
 
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
@@ -27,7 +29,10 @@ RUN_VALUE_NAME = "LsletUI"
 ALLOWED_DELAYS = (5000, 10000, 30000)
 
 # 允许的界面语言
-ALLOWED_LANGUAGES = ("zh", "en")
+ALLOWED_LANGUAGES = ("zh", "zh-TW", "en", "ja", "ko", "de", "ru", "vi")
+
+# 允许的界面主题
+ALLOWED_THEMES = ("dark", "light")
 
 DEFAULT_SETTINGS = {
     "autostart": False,
@@ -35,10 +40,17 @@ DEFAULT_SETTINGS = {
     "auto_dim_delay": 10000,
     # 灵动岛提醒开关（各功能独立，关掉则不弹对应胶囊）
     "notify_bluetooth": True,
-    "notify_download": True,
+    "notify_clipboard": True,
     "notify_hardware": True,
+    "notify_todo": True,
     # 界面语言
     "language": "zh",
+    # 界面主题（黑/白）
+    "theme": "dark",
+    # 液态玻璃层（灵动岛下方实时折射玻璃，默认开启）
+    "liquid_glass_enabled": True,
+    # 硬件预检结果（启动时一次性检测，运行期不变；重启后重新判定）
+    "liquid_glass_hw": None,
 }
 
 
@@ -77,17 +89,53 @@ class SettingsBackend(QObject):
         # 修正非法语言值
         if self._settings["language"] not in ALLOWED_LANGUAGES:
             self._settings["language"] = "zh"
+        # 修正非法主题值
+        if self._settings["theme"] not in ALLOWED_THEMES:
+            self._settings["theme"] = "dark"
 
     def _save(self):
+        data = json.dumps(self._settings, ensure_ascii=False, indent=2)
+        tmp_file = self.settings_file.with_suffix(".json.tmp")
+        last_err = None
+        for attempt in range(3):
+            try:
+                # 原子写入：先写临时文件，再 os.replace 覆盖。
+                # Windows 上 os.replace 对已存在的目标文件是原子替换，
+                # 避免直接 write_text 期间被杀软/索引器/其他进程占用导致 Permission denied。
+                tmp_file.write_text(data, encoding="utf-8")
+                os.replace(tmp_file, self.settings_file)
+                return
+            except PermissionError as e:
+                # 杀软/索引器瞬时占用文件时常见，退避重试
+                last_err = e
+                time.sleep(0.3 * (attempt + 1))
+            except Exception as e:
+                print(f"[Settings] 保存设置失败: {e}")
+                try:
+                    tmp_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return
         try:
-            self.settings_file.write_text(
-                json.dumps(self._settings, ensure_ascii=False, indent=2),
-                encoding="utf-8")
-        except Exception as e:
-            print(f"[Settings] 保存设置失败: {e}")
+            tmp_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        print(f"[Settings] 保存设置失败（重试3次仍被占用）: {last_err}")
 
     def get_settings(self):
+        # 每次读取时注入最新的硬件预检结果（不持久化到磁盘）
+        self._settings["liquid_glass_hw"] = self._hw_precheck_result()
         return dict(self._settings)
+
+    @staticmethod
+    def _hw_precheck_result():
+        """启动时一次性硬件预检（HwPrecheck 内部缓存，进程内只跑一次）。"""
+        try:
+            from capsule_app.hw_precheck import HwPrecheck
+            return HwPrecheck.instance().result()
+        except Exception as e:
+            print(f"[Settings] 硬件预检失败: {e}")
+            return None
 
     def set_web_view(self, web_view):
         if web_view not in self._web_views:
@@ -123,9 +171,25 @@ class SettingsBackend(QObject):
             if value not in ALLOWED_LANGUAGES:
                 return None
             self._settings["language"] = value
-        elif key in ("notify_bluetooth", "notify_download",
-                     "notify_hardware"):
+        elif key == "theme":
+            if value not in ALLOWED_THEMES:
+                return None
+            self._settings["theme"] = value
+        elif key in ("notify_bluetooth", "notify_clipboard",
+                     "notify_hardware", "notify_todo"):
             self._settings[key] = bool(value)
+        elif key == "liquid_glass_enabled":
+            value = bool(value)
+            # 硬件不达标时强制锁定为关闭，不允许开启
+            hw = self._hw_precheck_result()
+            if value and isinstance(hw, dict) and not hw.get("supported", False):
+                print("[Settings] 硬件不满足液态玻璃要求，忽略开启请求")
+                self._settings["liquid_glass_enabled"] = False
+                self._save()
+                self.settings_changed.emit(self.get_settings())
+                self._push_to_frontend()
+                return self.get_settings()
+            self._settings["liquid_glass_enabled"] = value
         else:
             return None
 

@@ -95,8 +95,6 @@ class IslandWindow:
         self._is_dimmed = False
         self._hovering = False
         self._animating = False
-        self.drag_start_x = 0
-        self.drag_start_y = 0
 
     def create_window(self):
         """创建灵动岛窗口"""
@@ -139,7 +137,6 @@ class IslandWindow:
 
         # 绑定事件
         self.canvas.bind('<Button-1>', self.on_click)
-        self.canvas.bind('<B1-Motion>', self.on_drag)
         self.canvas.bind('<Enter>', self.on_enter)
         self.canvas.bind('<Leave>', self.on_leave)
 
@@ -178,14 +175,7 @@ class IslandWindow:
 
     def on_click(self, event):
         """鼠标点击事件"""
-        self.drag_start_x = event.x
-        self.drag_start_y = event.y
-
-    def on_drag(self, event):
-        """鼠标拖动事件"""
-        x = self.root.winfo_x() + event.x - self.drag_start_x
-        y = self.root.winfo_y() + event.y - self.drag_start_y
-        self.root.geometry(f"+{x}+{y}")
+        pass
 
     def on_enter(self, event):
         """鼠标进入事件 - 悬停放大"""

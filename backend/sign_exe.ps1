@@ -24,8 +24,7 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $ExeDir = Join-Path $ProjectRoot "exe"
 
 $Targets = @(
-    (Join-Path $ExeDir "LsletUI\LsletUI.exe"),
-    (Join-Path $ExeDir "LsletUI\_internal\PySide6\QtWebEngineProcess.exe"),
+    (Join-Path $ExeDir "LsletUIFree\LsletUIFree.exe"),
     (Join-Path $ExeDir "PyIslandLite\PyIslandLite.exe")
 )
 

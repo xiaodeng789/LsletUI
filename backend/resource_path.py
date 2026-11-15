@@ -3,7 +3,7 @@
 资源路径兼容模块
 支持两种运行环境：
 1. 开发源码模式 (直接运行 .py)
-2. PyInstaller/Nuitka 打包本地运行 (dist目录下双击exe)
+2. PyInstaller 打包本地运行 (dist目录下双击exe)
 
 使用方式：
     from resource_path import get_resource_path, get_config_path

@@ -8,9 +8,21 @@
     "width": 240,
     "height": 52
   },
-  "expanded": {
-    "width": 360,
-    "height": 120
+  "music_collapsed": {
+    "width": 260,
+    "height": 44
+  },
+  "music_hover": {
+    "width": 320,
+    "height": 56
+  },
+  "video_collapsed": {
+    "width": 280,
+    "height": 44
+  },
+  "video_hover": {
+    "width": 340,
+    "height": 56
   },
   "background_color": "#000000",
   "background_alpha": 0.92,
@@ -22,5 +34,6 @@
   },
   "auto_hide": true,
   "auto_hide_delay": 10000,
-  "stay_on_top": true
+  "stay_on_top": true,
+  "debug_log": true
 }

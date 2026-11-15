@@ -20,6 +20,7 @@ def main():
     backend_dir = Path(__file__).parent / "backend"
     service_script = backend_dir / "main.py"
 
+    # 使用当前解释器（需已安装 PySide6）
     python_exe = sys.executable
 
     try:
